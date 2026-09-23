@@ -1,0 +1,16 @@
+{
+  "name": "anchor",
+  "version": "0.1.0",
+  "description": "Одна тема — одна вкладка herdr, один git worktree, один якорь в beads. Сессия становится одноразовой: состояние живёт в трекере, а не в её контексте.",
+  "author": {
+    "name": "Kirill Pavlyashik"
+  },
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "herdr",
+    "beads",
+    "worktree",
+    "session-management"
+  ]
+}
