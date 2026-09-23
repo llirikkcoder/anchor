@@ -1,0 +1,13 @@
+{
+  "name": "anchor",
+  "owner": {
+    "name": "Kirill Pavlyashik"
+  },
+  "plugins": [
+    {
+      "name": "anchor",
+      "source": "./",
+      "description": "Одна тема — одна вкладка herdr, один git worktree, один якорь в beads"
+    }
+  ]
+}
