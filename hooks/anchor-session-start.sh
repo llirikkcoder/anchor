@@ -68,8 +68,20 @@ bd() { BEADS_DIR="$root/.beads" command bd "$@"; }
 # Чтобы то же самое работало у самой сессии, а не только внутри хука, кладём
 # переменную в настройки worktree. Файл дополняем, а не переписываем: там могут
 # быть чужие настройки, и затирать их хуком — худший способ познакомиться.
+#
+# Здесь же чиним вторую беду того же рода — команды хуков через
+# $CLAUDE_PROJECT_DIR. В дереве темы переменная указывает на САМО дерево, а
+# скрипты хуков лежат в основном и обычно не под контролем версий: settings
+# в дерево доезжают, скрипты нет. Каждая остановка сессии печатает «Hook script
+# appears to be missing», и хук при этом не работает в темах вовсе.
+#
+# Правим путь на абсолютный, а не линкуем каталог: ссылку нужно не забыть
+# создать для каждого нового дерева, и её отсутствие отказывает молча.
+# ВАЖНО: настройки читаются при старте сессии, поэтому правка догоняет
+# СЛЕДУЮЩУЮ сессию в этом каталоге, а не текущую. Состояние сходится, но не
+# мгновенно — дерево, заведённое вручную, один раз ошибку всё же напечатает.
 if [ -n "$here" ] && [ "$here" != "$root" ] && command -v python3 >/dev/null 2>&1; then
-  BEADS_DIR_VALUE="$root/.beads" SETTINGS_DIR="$here/.claude" python3 - <<'PY' 2>/dev/null
+  BEADS_DIR_VALUE="$root/.beads" ROOT_DIR="$root" SETTINGS_DIR="$here/.claude" python3 - <<'PY' 2>/dev/null
 import json, os, pathlib
 d = pathlib.Path(os.environ["SETTINGS_DIR"]); d.mkdir(exist_ok=True)
 p = d / "settings.local.json"
@@ -79,9 +91,38 @@ try:
         raise ValueError
 except Exception:
     cfg = {}
+
+changed = False
+
 env = cfg.setdefault("env", {})
 if env.get("BEADS_DIR") != os.environ["BEADS_DIR_VALUE"]:
     env["BEADS_DIR"] = os.environ["BEADS_DIR_VALUE"]
+    changed = True
+
+# $CLAUDE_PROJECT_DIR в команде хука → абсолютный путь основного дерева.
+# Трогаем только те команды, где подстановка ведёт к несуществующему файлу:
+# если скрипт в дереве есть, значит он туда положен намеренно.
+root = os.environ["ROOT_DIR"]
+for group in (cfg.get("hooks") or {}).values():
+    if not isinstance(group, list):
+        continue
+    for matcher in group:
+        for h in (matcher or {}).get("hooks", []) or []:
+            cmd = h.get("command")
+            if not isinstance(cmd, str) or "$CLAUDE_PROJECT_DIR" not in cmd:
+                continue
+            here_path = cmd.replace("$CLAUDE_PROJECT_DIR", os.environ["SETTINGS_DIR"].rsplit("/.claude", 1)[0])
+            script = None
+            for token in here_path.replace('"', " ").split():
+                if token.endswith((".py", ".sh", ".js", ".ts")):
+                    script = token
+                    break
+            if script and os.path.isfile(script):
+                continue  # скрипт на месте — не наше дело
+            h["command"] = cmd.replace("$CLAUDE_PROJECT_DIR", root)
+            changed = True
+
+if changed:
     p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
 PY
 fi
