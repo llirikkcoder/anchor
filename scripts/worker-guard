@@ -37,6 +37,7 @@ BASH_DENY = [
     (r"\bgit\s+push\b[^|;&]*(--force(?!-with-lease)|\s-f\b)", "push --force без --force-with-lease"),
     (r"\bgit\s+push\b[^|;&]*(--delete|\s:[\w./-]+)", "удаление ветки на сервере"),
     (r"\.secrets\b", "секреты — только у оркестратора"),
+    (r"db_full_backup|(^|[\s/])backups/\S*\.sql", "копии базы содержат данные клиентов — только у оркестратора"),
     (r"\bDATABASE_URL\b|\bSUPABASE_SERVICE(_ROLE)?_KEY\b", "ключи рабочей базы — только у оркестратора"),
     (r"\b(psql|pg_dump|pg_restore)\b|postgres:\d+-alpine", "прямой доступ к рабочей базе — только у оркестратора"),
     (r"\bsupabase\s+(db|migration)\b", "миграции применяет оркестратор после копии базы"),
@@ -62,6 +63,7 @@ WRITE_DENY = [
 
 READ_DENY = [
     (r"/\.secrets(/|$)", "секреты — только у оркестратора"),
+    (r"(^|/)backups/[^/]*\.(sql|dump|gz)$|db_full_backup", "копии базы содержат данные клиентов — только у оркестратора"),
     (r"(^|/)\.env(\.(?!example$|sample$|template$)[\w-]+)?$", ".env с ключами — только у оркестратора"),
 ]
 
