@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""
+Ограда воркера anchor: хук PreToolUse для сессий без вопросов о разрешении.
+
+ЗАЧЕМ. Воркер запускают в режиме bypassPermissions, чтобы он не простаивал на
+каждом «можно?» (03.10.2026 воркер стоял на вопросе, пока его не заметили).
+Но правило «необратимое — только с „да“ человека» от этого не отменяется. В
+режиме без вопросов его держит этот хук: хуки срабатывают и тогда, когда
+разрешения не спрашиваются. Отказ — код 2 и причина в stderr: Claude видит её
+и идёт другим путём или пишет оркестратору.
+
+ЧТО ЗАКРЫТО — только необратимое и чужое, не обычная работа:
+- слияние PR, релизы, удаление репозиториев и веток на сервере;
+- push в main/master и push --force без --force-with-lease;
+- секреты (~/.secrets, .env с ключами) и прямой доступ к рабочей базе;
+- деплой в прод, sudo, установка системных пакетов;
+- закрытие чужих панелей и деревьев herdr, удаление задач beads;
+- rm -rf вне своего дерева.
+
+Список — регулярные выражения ниже. Ложный отказ дешевле, чем ложный пропуск:
+воркер, упёршийся в ограду, напишет оркестратору, а оркестратор сделает это
+сам или спросит человека.
+"""
+import json
+import os
+import re
+import sys
+
+BASH_DENY = [
+    (r"\bgh\s+pr\s+merge\b", "слияние PR делает оркестратор после своей проверки"),
+    (r"\bgh\s+release\s+(create|delete|edit)\b", "релиз — решение человека"),
+    (r"\bgh\s+repo\s+(delete|archive|rename|edit)\b", "репозиторий — решение человека"),
+    (r"\bgh\s+api\b.*-X\s*(DELETE|PUT|PATCH)", "правка GitHub через API — решение человека"),
+    (r"\bgit\s+push\b[^|;&]*(\s|:)(main|master)(\s|$|[;&|])", "push в main/master — только с «да» человека"),
+    (r"\bgit\s+push\b[^|;&]*(--force(?!-with-lease)|\s-f\b)", "push --force без --force-with-lease"),
+    (r"\bgit\s+push\b[^|;&]*(--delete|\s:[\w./-]+)", "удаление ветки на сервере"),
+    (r"\.secrets\b", "секреты — только у оркестратора"),
+    (r"\bDATABASE_URL\b|\bSUPABASE_SERVICE(_ROLE)?_KEY\b", "ключи рабочей базы — только у оркестратора"),
+    (r"\b(psql|pg_dump|pg_restore)\b|postgres:\d+-alpine", "прямой доступ к рабочей базе — только у оркестратора"),
+    (r"\bsupabase\s+(db|migration)\b", "миграции применяет оркестратор после копии базы"),
+    (r"\b(railway|vercel)\b[^|;&]*(\s)(up|deploy|--prod|redeploy|variables\s+set)(\s|$)", "деплой и переменные прода — решение человека"),
+    (r"(^|[;&|]\s*)sudo\b", "sudo"),
+    (r"\b(apt|apt-get|dnf|yum|snap)\s+(install|remove|purge)\b", "системные пакеты"),
+    (r"\bherdr\s+(workspace|pane|tab|worktree)\s+(close|remove|delete|move)\b", "раскладку herdr меняет оркестратор"),
+    (r"\bherdr\s+agent\s+(prompt|start|stop)\b", "другими агентами управляет оркестратор"),
+    (r"\bbd\s+delete\b", "удалять задачи beads — оркестратор"),
+    (r"\bgit\s+worktree\s+(remove|prune)\b", "деревья убирает оркестратор"),
+    (r"\bgit\s+branch\s+-[dD]\b", "удаление веток — оркестратор"),
+    (r"\bcrontab\b|\bsystemctl\s+(start|stop|restart|enable|disable)\b", "службы машины"),
+]
+
+READ_DENY = [
+    (r"/\.secrets(/|$)", "секреты — только у оркестратора"),
+    (r"(^|/)\.env(\.(?!example$|sample$|template$)[\w-]+)?$", ".env с ключами — только у оркестратора"),
+]
+
+
+def deny(reason: str) -> None:
+    print(f"worker-guard: отказ — {reason}. Если это нужно для темы, напиши "
+          f"оркестратору в итоге или в якорь, он сделает сам или спросит человека.",
+          file=sys.stderr)
+    sys.exit(2)
+
+
+def rm_outside_tree(cmd: str, cwd: str) -> bool:
+    for m in re.finditer(r"\brm\s+(-\w*r\w*f\w*|-\w*f\w*r\w*|-r\s+-f|-f\s+-r)\s+([^;&|]+)", cmd):
+        for target in m.group(2).split():
+            if target.startswith("-"):
+                continue
+            path = os.path.realpath(os.path.join(cwd, os.path.expanduser(target)))
+            root = os.path.realpath(cwd)
+            if path == "/" or not (path == root or path.startswith(root + os.sep)):
+                return True
+    return False
+
+
+def main() -> None:
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        return
+    tool = data.get("tool_name", "")
+    inp = data.get("tool_input") or {}
+    cwd = data.get("cwd") or os.getcwd()
+
+    if tool == "Bash":
+        cmd = inp.get("command", "")
+        for pattern, reason in BASH_DENY:
+            if re.search(pattern, cmd):
+                deny(reason)
+        if rm_outside_tree(cmd, cwd):
+            deny("rm -rf вне своего дерева")
+    elif tool in ("Read", "Edit", "Write", "NotebookEdit", "Grep", "Glob"):
+        path = inp.get("file_path") or inp.get("notebook_path") or inp.get("path") or ""
+        path = os.path.expanduser(path)
+        for pattern, reason in READ_DENY:
+            if re.search(pattern, path):
+                deny(reason)
+
+
+if __name__ == "__main__":
+    main()
