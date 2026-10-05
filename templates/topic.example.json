@@ -1,0 +1,23 @@
+{
+  "anchor": "aio-0qk.1",
+  "label": "aio-0qk.1 шаги в URL",
+  "name": "w-aio-0qk-1",
+  "trees": [
+    {
+      "repo": "/home/develop/projects/ai-office-frontend",
+      "branch": "feature/aio-0qk.1-steps-url",
+      "path": "/home/develop/projects/wt/aio-0qk.1-front",
+      "base": "main"
+    },
+    {
+      "repo": "/home/develop/projects/ai-office-assistant",
+      "branch": "feature/aio-0qk.1-steps-url",
+      "path": "/home/develop/projects/wt/aio-0qk.1-back"
+    }
+  ],
+  "beads_dir": "/home/develop/projects/ai-office-assistant/.beads",
+  "links": {
+    "node_modules": "/home/develop/projects/wt/_shared-front/node_modules"
+  },
+  "prompt_file": "/home/develop/.anchor/prompts/aio-0qk.1.md"
+}
