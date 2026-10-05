@@ -156,6 +156,16 @@ for t in "${trees[@]}"; do
   if [ -z "$pr" ]; then
     pr=$(gh pr list -R "$slug" --head "$rb" --state open --json url -q '.[0].url' 2>/dev/null)
   fi
+  # Слитый PR с тем же коммитом — тема уже сдана и слита. Без этой проверки
+  # повторный вызов открывал дубль: 05.10.2026 после слияния anchor#1 (squash)
+  # появился #2 с тем же коммитом — и в «конфликте» с main, и со слиянием,
+  # которое откатило бы правки, сделанные после #1.
+  if [ -z "$pr" ]; then
+    head=$(git -C "$t" rev-parse HEAD)
+    merged=$(gh pr list -R "$slug" --head "$rb" --state merged --json url,headRefOid \
+      -q ".[] | select(.headRefOid == \"$head\") | .url" 2>/dev/null | head -1)
+    [ -n "$merged" ] && die "$t: этот коммит уже слит ($merged) — сдавать нечего"
+  fi
   if [ -z "$pr" ]; then
     [ "$status" = "done" ] || { pr_lines+=("$slug: PR не открыт (не сделано)"); continue; }
     body=$(printf '%s\n\nЯкорь: %s — %s\n' "$summary" "$anchor" "$atitle")
