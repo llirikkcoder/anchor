@@ -28,6 +28,8 @@ import sys
 
 BASH_DENY = [
     (r"\bgh\s+pr\s+merge\b", "слияние PR делает оркестратор после своей проверки"),
+    (r"(^|[\s;&|/])anchor-merge(\s|$)", "слияние PR делает оркестратор после своей проверки"),
+    (r"\banchor-queue\s+run\b", "запуск воркеров из очереди — оркестратор"),
     (r"\bgh\s+release\s+(create|delete|edit)\b", "релиз — решение человека"),
     (r"\bgh\s+repo\s+(delete|archive|rename|edit)\b", "репозиторий — решение человека"),
     (r"\bgh\s+api\b.*-X\s*(DELETE|PUT|PATCH)", "правка GitHub через API — решение человека"),
