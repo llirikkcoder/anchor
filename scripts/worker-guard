@@ -46,7 +46,16 @@ BASH_DENY = [
     (r"\bbd\s+delete\b", "удалять задачи beads — оркестратор"),
     (r"\bgit\s+worktree\s+(remove|prune)\b", "деревья убирает оркестратор"),
     (r"\bgit\s+branch\s+-[dD]\b", "удаление веток — оркестратор"),
+    (r"worker-guard|settings(\.local)?\.json|\.claude/hooks|\.claude\.json", "ограду и настройки Claude правит только оркестратор"),
     (r"\bcrontab\b|\bsystemctl\s+(start|stop|restart|enable|disable)\b", "службы машины"),
+]
+
+# Правка ограды и настроек Claude: из режима без вопросов воркер иначе мог бы
+# снять хук с себя — настройки Claude Code перечитывает на ходу.
+WRITE_DENY = [
+    (r"worker-guard$", "ограду правит только оркестратор"),
+    (r"(^|/)\.claude/(settings(\.local)?\.json|hooks/)", "настройки Claude правит только оркестратор"),
+    (r"(^|/)\.claude\.json$", "настройки Claude правит только оркестратор"),
 ]
 
 READ_DENY = [
@@ -96,6 +105,10 @@ def main() -> None:
         for pattern, reason in READ_DENY:
             if re.search(pattern, path):
                 deny(reason)
+        if tool in ("Edit", "Write", "NotebookEdit"):
+            for pattern, reason in WRITE_DENY:
+                if re.search(pattern, path):
+                    deny(reason)
 
 
 if __name__ == "__main__":
