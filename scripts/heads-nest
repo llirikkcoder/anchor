@@ -1,0 +1,113 @@
+#!/bin/sh
+# heads-nest — показать воркспейс herdr вложенным под воркспейсом оркестратора,
+# не трогая каталог, в котором работает агент.
+#
+# ЗАЧЕМ (05.10.2026). Схема знает темы: у темы настоящее дерево своего
+# репозитория, и herdr сам вкладывает её под основной воркспейс репозитория.
+# Но на сервере живут и головы — долгоживущие агенты вне репозиториев
+# (продавец, клиентский бот), — и оркестратор, который ведёт темы нескольких
+# репозиториев. Их боковая панель показывала россыпью на верхнем уровне.
+#
+# КАК. herdr рисует вложенность по метаданным воркспейса: связанное дерево
+# (linked worktree) репозитория X стоит под основным воркспейсом X. Каталоги
+# панелей в этом не участвуют. Поэтому заводим пустой репозиторий-родитель,
+# на каждую голову — его связанное дерево, открываем его в herdr и переносим
+# туда живую панель. Процесс и его cwd не меняются, git в панели работает с
+# настоящим репозиторием.
+#
+# ЦЕНА. Держится на поведении herdr, а не на его обещании. Уровней два. Команды
+# herdr для деревьев видят подставное дерево, а не настоящее: тему, накрытую
+# так, закрывают /anchor-done, а затем `heads-nest --remove <имя>`.
+#
+#   heads-nest <имя> <pane_id> [--label "подпись"]   перенести живую панель
+#   heads-nest <имя> --cwd <каталог> [--label …]     пустой шелл в каталоге
+#   heads-nest --remove <имя>                        убрать воркспейс и дерево
+#   heads-nest --list                                что вложено сейчас
+#
+# HEADS_ROOT   где лежат деревья (по умолчанию ~/heads)
+# HEADS_PARENT имя родителя и подпись его воркспейса (по умолчанию orchestrator)
+# HERDR_SESSION сессия herdr, если команду зовут не из неё
+
+ROOT=${HEADS_ROOT:-$HOME/heads}
+PARENT=${HEADS_PARENT:-orchestrator}
+MAIN=$ROOT/$PARENT
+
+die() { echo "heads-nest: $*" >&2; exit 1; }
+js() { python3 -c "import sys,json; d=json.load(sys.stdin); print($1)"; }
+
+# воркспейсы herdr, открытые из дерева $1
+ws_of() {
+  herdr workspace list | js "' '.join(w['workspace_id'] for w in d['result']['workspaces'] if (w.get('worktree') or {}).get('checkout_path')=='$1')"
+}
+
+ensure_main() {
+  if [ ! -d "$MAIN/.git" ]; then
+    mkdir -p "$MAIN" || die "не создать $MAIN"
+    git -C "$MAIN" init -q -b main || die "git init не вышел"
+    git -C "$MAIN" commit -q --allow-empty \
+      -m "Группировка воркспейсов herdr: пустой репозиторий, не пушить" || die "первый коммит не вышел"
+  fi
+  [ -n "$(ws_of "$MAIN")" ] || herdr worktree open --cwd "$MAIN" --path "$MAIN" \
+    --label "$PARENT" --no-focus --trust-repository >/dev/null || die "не открыть $MAIN в herdr"
+}
+
+case "${1:-}" in
+  ""|-h|--help)
+    sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  --list)
+    herdr workspace list | js "'\n'.join(w['workspace_id']+'  '+w['label']+'  '+(w.get('worktree') or {}).get('checkout_path','') for w in d['result']['workspaces'] if (w.get('worktree') or {}).get('repo_root')=='$MAIN')"
+    exit 0 ;;
+  --remove)
+    name=${2:-}; [ -n "$name" ] || die "какую голову убрать?"
+    path=$ROOT/$name
+    [ "$path" != "$MAIN" ] || die "родителя $PARENT не удаляю"
+    for w in $(ws_of "$path"); do
+      n=$(herdr pane list --workspace "$w" | js "sum(1 for p in d['result']['panes'] if p.get('agent'))")
+      [ "$n" = 0 ] || die "в $w работает агент — сначала перенеси или останови его"
+      herdr workspace close "$w" >/dev/null
+    done
+    if git -C "$MAIN" worktree list --porcelain | grep -qx "worktree $path"; then
+      git -C "$MAIN" worktree remove "$path" || die "дерево $path не убралось"
+    fi
+    git -C "$MAIN" branch -q -D "head/$name" 2>/dev/null
+    echo "убрано: $name"; exit 0 ;;
+esac
+
+name=$1; shift
+case "$name" in
+  */*|.*|"$PARENT") die "недопустимое имя: $name" ;;
+esac
+pane=; cwd=; label=$name
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --label) [ -n "${2:-}" ] || die "--label без значения"; label=$2; shift 2 ;;
+    --cwd)   [ -n "${2:-}" ] || die "--cwd без значения"; cwd=$2; shift 2 ;;
+    -*)      die "неизвестный ключ $1" ;;
+    *)       pane=$1; shift ;;
+  esac
+done
+[ -n "$pane" ] || [ -n "$cwd" ] || die "нужен pane_id или --cwd"
+[ -z "$pane" ] || herdr pane get "$pane" >/dev/null 2>&1 || die "панели $pane нет"
+[ -z "$cwd" ] || [ -d "$cwd" ] || die "каталога $cwd нет"
+
+ensure_main
+path=$ROOT/$name
+[ -z "$(ws_of "$path")" ] || die "$name уже вложен ($(ws_of "$path"))"
+[ -d "$path" ] || git -C "$MAIN" worktree add -q "$path" -b "head/$name" || die "дерево $path не создалось"
+
+r=$(herdr worktree open --cwd "$MAIN" --path "$path" --label "$label" --no-focus --trust-repository) \
+  || die "herdr не открыл $path"
+ws=$(printf '%s' "$r" | js "d['result']['root_pane']['workspace_id']")
+shell=$(printf '%s' "$r" | js "d['result']['root_pane']['pane_id']")
+tab=$(printf '%s' "$r" | js "d['result']['root_pane']['tab_id']")
+
+if [ -n "$pane" ]; then
+  new=$(herdr pane move "$pane" --tab "$tab" --target-pane "$shell" --split down \
+        | js "d['result']['move_result']['pane']['pane_id']") || die "панель $pane не перенеслась"
+  herdr pane close "$shell" >/dev/null
+else
+  herdr pane run "$shell" "cd '$(printf '%s' "$cwd" | sed "s/'/'\\\\''/g")'" >/dev/null
+  new=$shell
+fi
+herdr tab rename "$tab" "$label" >/dev/null
+echo "$label → $ws ($new) под $PARENT"
