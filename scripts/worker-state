@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""
+worker-state — воркер сам говорит, в каком он состоянии; оркестратор сводит
+это со статусом herdr и временем.
+
+ЗАЧЕМ. Статус herdr видит терминал, а не работу: `idle` одинаков у
+закончившего, у ждущего сброса лимита и у потерявшего нить; `done` бывает при
+живой фоновой сборке. Gas Town решал это пульсом и сторожем, который убивал
+«зависших», — и убивал здоровых: упор в лимит использования принимался за
+зависание. Поэтому здесь «застрял» не объявляется по одному признаку, а
+скрипт только сообщает и никогда ничего не останавливает.
+
+Воркер (из своего дерева):
+  worker-state working "<что делаю>"
+  worker-state waiting "<чего жду: фоновая сборка, лимит, ответ человека>"
+  worker-state stuck   "<обо что упёрся>"
+→ .anchor/state.json: state, reason, at, branch.
+
+Оркестратор:
+  worker-state --show [дерево…]     свод по деревьям; без аргументов — по всем
+                                    агентам herdr с префиксом ANCHOR_WORKER_PREFIX
+
+Свод (по каждому дереву, сверху вниз — первое подошедшее):
+  ГОТОВО        .anchor/done.json свежее state.json
+  РАБОТАЕТ      herdr: working — терминал живёт, отметка воркера не нужна
+  ВОПРОС        herdr: blocked — диалог; смотреть agent read, решать человеку
+  ЖДЁТ          воркер сам сказал waiting — причина внешняя, не трогать
+  ЛИМИТ         в хвосте панели упор в лимит использования — ждать сброса
+  ЗАСТРЯЛ       воркер сам сказал stuck И herdr не working — два признака
+  МОЛЧИТ        herdr не working, маркера нет, отметке больше ANCHOR_STALE
+                минут (по умолчанию 30) — посмотреть agent read; НЕ убивать
+  ПАУЗА         herdr не working, отметка свежая — ход кончился, это норма
+
+ANCHOR_STALE по умолчанию 30 минут — под ожидание фоновых проверок через heavy,
+а не под длину темы: сама тема идёт часами. Порог — повод посмотреть, не
+повод действовать.
+"""
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+
+STATES = ("working", "waiting", "stuck", "done")
+PREFIX = os.environ.get("ANCHOR_WORKER_PREFIX", "w-")
+STALE_MIN = float(os.environ.get("ANCHOR_STALE", "30"))
+# Тексты, которыми Claude Code сообщает об упоре в лимит. Широко намеренно:
+# ложное «ЛИМИТ» стоит одного взгляда, ложное «МОЛЧИТ» — убитой работы.
+LIMIT_RX = re.compile(r"usage limit|limit reached|rate.?limit|resets? (at|in)|лимит", re.I)
+
+
+def now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+
+
+def parse_at(s: str) -> datetime.datetime:
+    return datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+
+
+def git(tree: str, *args: str) -> str:
+    r = subprocess.run(["git", "-C", tree, *args], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def read_json(path: str):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def write_state(state: str, reason: str) -> None:
+    tree = git(".", "rev-parse", "--show-toplevel")
+    if not tree:
+        sys.exit("worker-state: не в git-дереве")
+    os.makedirs(os.path.join(tree, ".anchor"), exist_ok=True)
+    # Машинное — мимо коммита: строка в info/exclude, а не в .gitignore.
+    ex = os.path.join(git(tree, "rev-parse", "--path-format=absolute", "--git-common-dir"), "info", "exclude")
+    os.makedirs(os.path.dirname(ex), exist_ok=True)
+    have = open(ex).read().split("\n") if os.path.exists(ex) else []
+    with open(ex, "a") as f:
+        for pat in ("/.anchor/done.json", "/.anchor/state.json"):
+            if pat not in have:
+                f.write(pat + "\n")
+    rec = {
+        "state": state, "reason": reason,
+        "at": now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "branch": git(tree, "rev-parse", "--abbrev-ref", "HEAD"),
+        "agent_pane": os.environ.get("HERDR_PANE_ID", ""),
+    }
+    path = os.path.join(tree, ".anchor", "state.json")
+    with open(path + ".tmp", "w") as f:
+        json.dump(rec, f, ensure_ascii=False, indent=2)
+    os.replace(path + ".tmp", path)
+    print(f"{state}: {reason}")
+
+
+def herdr_agents() -> list:
+    try:
+        out = subprocess.run(["herdr", "agent", "list"], capture_output=True, text=True, timeout=20).stdout
+        return json.loads(out)["result"]["agents"]
+    except Exception:
+        return []
+
+
+def tail_has_limit(agent: dict) -> bool:
+    target = agent.get("name") or agent.get("pane_id")
+    try:
+        out = subprocess.run(["herdr", "agent", "read", target, "--source", "recent-unwrapped", "--lines", "15"],
+                             capture_output=True, text=True, timeout=20).stdout
+    except Exception:
+        return False
+    return bool(LIMIT_RX.search(out))
+
+
+def verdict(tree: str, agent) -> tuple:
+    st = read_json(os.path.join(tree, ".anchor", "state.json")) or {}
+    dn = read_json(os.path.join(tree, ".anchor", "done.json"))
+    hs = (agent or {}).get("agent_status", "нет агента")
+    st_at = parse_at(st["at"]) if st.get("at") else None
+    age = (now() - st_at).total_seconds() / 60 if st_at else None
+    ago = f"{age:.0f} мин назад" if age is not None else "отметок не было"
+
+    if dn and (st_at is None or st.get("state") == "done" or parse_at(dn["at"]) >= st_at):
+        word = "ГОТОВО" if dn.get("status") == "done" else "СДАНО НЕ СДЕЛАННЫМ"
+        return word, f"{dn.get('summary', '')} · {' '.join(dn.get('prs', []))}"
+    if hs == "working":
+        return "РАБОТАЕТ", f"herdr working; отметка: {st.get('state', '—')} {ago}"
+    if hs == "blocked":
+        return "ВОПРОС", "herdr blocked — agent read и к человеку, не отвечать за него"
+    if st.get("state") == "waiting":
+        return "ЖДЁТ", f"{st.get('reason', '')} ({ago})"
+    if agent and tail_has_limit(agent):
+        return "ЛИМИТ", "упор в лимит использования — ждать сброса, не перезапускать"
+    if st.get("state") == "stuck":
+        return "ЗАСТРЯЛ", f"{st.get('reason', '')} ({ago}); herdr {hs}"
+    if age is None or age > STALE_MIN:
+        return "МОЛЧИТ", f"herdr {hs}, маркера нет, {ago} — agent read, не убивать"
+    return "ПАУЗА", f"herdr {hs}; {st.get('state', '')} {st.get('reason', '')} ({ago})"
+
+
+def show(trees: list) -> None:
+    agents = herdr_agents()
+    by_cwd = {a.get("cwd"): a for a in agents}
+    if not trees:
+        trees = [a["cwd"] for a in agents if (a.get("name") or "").startswith(PREFIX) and a.get("cwd")]
+    if not trees:
+        print("воркеров нет")
+        return
+    for t in trees:
+        t = os.path.realpath(t)
+        a = by_cwd.get(t)
+        word, detail = verdict(t, a)
+        name = (a or {}).get("name") or (a or {}).get("pane_id") or "—"
+        print(f"{word:<9} {name:<14} {t}\n          {detail}")
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return
+    if args[0] == "--show":
+        show(args[1:])
+        return
+    if args[0] not in STATES or len(args) != 2 or not args[1].strip():
+        sys.exit(f"worker-state: нужно {'|'.join(STATES[:3])} \"<причина>\"")
+    write_state(args[0], args[1].strip())
+
+
+if __name__ == "__main__":
+    main()

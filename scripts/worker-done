@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# worker-done — воркер говорит «готово»: ветка запушена, PR есть, итог в якоре,
+# маркер в дереве. Аналог `gt done` из Gas Town, поверх herdr.
+#
+# ЗАЧЕМ. Оркестратор узнавал о конце работы по статусу herdr, а статус врёт в
+# обе стороны: `done` приходит, когда воркер оставил в фоне сборку и закончил
+# ход («1 shell still running», PR откроет потом), а `idle` — и у закончившего,
+# и у ждущего лимита. Признак готовности в схеме и так был — PR и итог в
+# якоре, — но проверял его человек глазами. Теперь воркер ставит его одной
+# командой, а оркестратор ждёт файл, а не угадывает по статусу.
+#
+#   worker-done "<итог>"                     сделано: push, PR, итог, маркер
+#   worker-done --not-done "<что мешает>"    не сделано: то же, но честно
+#   worker-done "<итог>" --pr 123            PR уже открыт — принять номер (или URL)
+#   worker-done "<итог>" --tree <дерево>     тема в двух репозиториях: каждое дерево
+#                                            ключом; без ключа — текущее
+#   worker-done --wait <дерево> [--timeout сек] [--since эпоха]
+#                                            ОРКЕСТРАТОРУ: ждать маркер, вышедший
+#                                            не раньше --since (по умолчанию — сейчас)
+#
+# --title "<заголовок PR>" (по умолчанию «<якорь>: <заголовок якоря>»),
+# --anchor <id> (по умолчанию — из имени ветки, как у хука старта),
+# --base <ветка> (по умолчанию main).
+#
+# Маркер — .anchor/done.json в каждом дереве темы: якорь, ветки, PR, итог,
+# «сделано/не сделано», время. Файл не версионируется: строка в
+# info/exclude репозитория, а не в .gitignore — .anchor/ бывает общим
+# (core.md, gates), и пускать туда машинное — значит однажды закоммитить.
+
+set -u
+die() { echo "worker-done: $*" >&2; exit 1; }
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# --- Ожидание оркестратора ----------------------------------------------------
+# Свежесть — по времени внутри маркера, а не по факту файла. Маркер прошлого
+# круга (воркер вернули на доработку) иначе сработает мгновенно: 05.10.2026
+# связка ожиданий через поиск строки в логе так и сработала по старой строке.
+if [ "${1:-}" = "--wait" ]; then
+  tree=${2:-}; [ -d "$tree" ] || die "--wait: нет каталога ${tree:-<пусто>}"
+  shift 2
+  timeout=7200; since=$(date +%s)
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --timeout) timeout=$2; shift 2 ;;
+      --since)   since=$2; shift 2 ;;
+      *) die "--wait: неизвестный ключ $1" ;;
+    esac
+  done
+  end=$(( $(date +%s) + timeout ))
+  f=$tree/.anchor/done.json
+  while [ "$(date +%s)" -lt "$end" ]; do
+    if [ -f "$f" ] && python3 - "$f" "$since" <<'PY'
+import json, sys, datetime
+d = json.load(open(sys.argv[1]))
+at = datetime.datetime.strptime(d["at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+sys.exit(0 if at.timestamp() >= float(sys.argv[2]) else 1)
+PY
+    then
+      cat "$f"; exit 0
+    fi
+    sleep 10
+  done
+  echo "worker-done: маркера нет за ${timeout} с — это не провал, посмотри worker-state --show $tree" >&2
+  exit 3
+fi
+
+# --- Разбор ключей ------------------------------------------------------------
+summary=; status="done"; title=; anchor=; base=main
+trees=(); prs=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --not-done) status=not_done; shift ;;
+    --pr)       prs+=("${2:?--pr без значения}"); shift 2 ;;
+    --tree)     trees+=("${2:?--tree без значения}"); shift 2 ;;
+    --title)    title=${2:?--title без значения}; shift 2 ;;
+    --anchor)   anchor=${2:?--anchor без значения}; shift 2 ;;
+    --base)     base=${2:?--base без значения}; shift 2 ;;
+    -h|--help)  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*)         die "неизвестный ключ $1" ;;
+    *)          [ -z "$summary" ] || die "итог уже задан; лишнее: $1"; summary=$1; shift ;;
+  esac
+done
+[ -n "$summary" ] || die "нужен итог: что сделано и чем проверено (или что мешает)"
+[ ${#trees[@]} -gt 0 ] || trees=("$(git rev-parse --show-toplevel 2>/dev/null)")
+[ -n "${trees[0]}" ] || die "не в git-дереве; укажи --tree"
+
+# owner/name по origin: без сети и без вопроса к gh, какой репозиторий «текущий».
+slug_of() {
+  git -C "$1" config --get remote.origin.url 2>/dev/null \
+    | sed -E 's#^(git@[^:]+:|https?://[^/]+/)##; s#\.git$##'
+}
+
+# --- Проверки до любых действий -----------------------------------------------
+# Всё, что может отказать, проверяется до push: полусделанный done (ветка
+# запушена, маркера нет) хуже честного отказа.
+for t in "${trees[@]}"; do
+  [ -d "$t" ] || die "нет дерева $t"
+  b=$(git -C "$t" rev-parse --abbrev-ref HEAD) || die "$t: не git"
+  case "$b" in
+    main|master|HEAD|"$base") die "$t: ветка $b — свою работу сдают из ветки темы, не из $b" ;;
+  esac
+  [ -n "$(slug_of "$t")" ] || die "$t: нет origin"
+  # Незакоммиченное в push не попадёт, а «сделано» с ним — неправда.
+  # Неотслеживаемые не валят (там бывают ссылки на окружение), но называются.
+  if [ "$status" = "done" ] && [ -n "$(git -C "$t" status --porcelain --untracked-files=no)" ]; then
+    die "$t: есть незакоммиченные правки — закоммить или сдай с --not-done"
+  fi
+  u=$(git -C "$t" status --porcelain 2>/dev/null | grep '^??' | grep -v ' \.anchor/' | head -5)
+  [ -z "$u" ] || printf 'worker-done: %s: неотслеживаемые файлы (не попадут в PR):\n%s\n' "$t" "$u" >&2
+done
+
+if [ -z "$anchor" ]; then
+  last=$(git -C "${trees[0]}" rev-parse --abbrev-ref HEAD); last=${last##*/}
+  anchor=$(printf '%s' "$last" | sed -E -n 's/^([a-z][a-z0-9]*-[a-z0-9]{3,8}(\.[0-9]+)?)(-.*)?$/\1/p')
+fi
+[ -n "$anchor" ] || die "якорь не читается из ветки — укажи --anchor <id>"
+command -v bd >/dev/null 2>&1 || die "нет bd — итог в якорь не записать"
+atitle=$(bd show "$anchor" --json 2>/dev/null | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin); print((d[0] if isinstance(d, list) else d).get("title", ""))
+except Exception:
+    pass')
+[ -n "$atitle" ] || die "якоря $anchor в beads нет (BEADS_DIR=${BEADS_DIR:-не задан})"
+[ -n "$title" ] || title="$anchor: $atitle"
+
+# --- push и PR по каждому дереву ------------------------------------------------
+pr_lines=(); branches=()
+for t in "${trees[@]}"; do
+  b=$(git -C "$t" rev-parse --abbrev-ref HEAD); slug=$(slug_of "$t")
+  branches+=("$slug:$b")
+  # Имя на сервере — то же, что локально. Если upstream уже другой (ветку
+  # переименовали локально — см. SKILL, PR при переименовании закрывается),
+  # пушим в него, а не плодим вторую ветку.
+  # Но дерево, заведённое от origin/main, следит за origin/main — upstream
+  # main значит «ещё не пушили», а не «пушить в main». Проверено на деле:
+  # без этой оговорки работа уезжала прямо в main.
+  up=$(git -C "$t" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)
+  rb=$b
+  case "$up" in
+    origin/main|origin/master|"origin/$base") ;;
+    origin/?*) rb=${up#origin/} ;;
+  esac
+  case "$rb" in
+    main|master|"$base") die "$t: push в $rb — не своя ветка" ;;
+  esac
+  git -C "$t" push -q -u origin "HEAD:refs/heads/$rb" || die "$t: push $rb не прошёл"
+
+  pr=
+  for p in "${prs[@]+"${prs[@]}"}"; do
+    case "$p" in
+      *"github.com/$slug/pull/"*) pr=$p ;;
+      *[!0-9]*) ;;
+      *) [ ${#trees[@]} -eq 1 ] && pr=$p ;;
+    esac
+  done
+  if [ -z "$pr" ]; then
+    pr=$(gh pr list -R "$slug" --head "$rb" --state open --json url -q '.[0].url' 2>/dev/null)
+  fi
+  if [ -z "$pr" ]; then
+    [ "$status" = "done" ] || { pr_lines+=("$slug: PR не открыт (не сделано)"); continue; }
+    body=$(printf '%s\n\nЯкорь: %s — %s\n' "$summary" "$anchor" "$atitle")
+    pr=$(gh pr create -R "$slug" --base "$base" --head "$rb" --title "$title" --body "$body") \
+      || die "$t: PR не открылся (push прошёл, ветка $rb на сервере)"
+  fi
+  url=$(gh pr view "$pr" -R "$slug" --json url -q .url 2>/dev/null) || url=$pr
+  pr_lines+=("$url")
+done
+
+# --- Итог в якорь ---------------------------------------------------------------
+# Якорь — канал передачи, а не прокрутка панели: она обрезается и не
+# переживает сессию.
+word=$([ "$status" = "done" ] && echo "СДЕЛАНО" || echo "НЕ СДЕЛАНО")
+note=$(printf '%s: %s\nВетки: %s\nPR: %s' "$word" "$summary" "${branches[*]}" "${pr_lines[*]}")
+bd comments add "$anchor" "$note" >/dev/null || die "итог в якорь $anchor не записался"
+
+# --- Маркер ---------------------------------------------------------------------
+at=$(now)
+for t in "${trees[@]}"; do
+  mkdir -p "$t/.anchor"
+  ex="$(git -C "$t" rev-parse --path-format=absolute --git-common-dir)/info/exclude"
+  mkdir -p "$(dirname "$ex")"
+  for pat in /.anchor/done.json /.anchor/state.json; do
+    grep -qxF "$pat" "$ex" 2>/dev/null || echo "$pat" >> "$ex"
+  done
+  ANCHOR="$anchor" STATUS="$status" SUMMARY="$summary" AT="$at" \
+  BRANCHES="$(printf '%s\n' "${branches[@]}")" PRS="$(printf '%s\n' "${pr_lines[@]}")" \
+  python3 - "$t/.anchor/done.json" <<'PY'
+import json, os, sys
+e = os.environ
+lines = lambda k: [x for x in e[k].splitlines() if x]
+json.dump({
+    "anchor": e["ANCHOR"], "status": e["STATUS"], "summary": e["SUMMARY"],
+    "branches": lines("BRANCHES"), "prs": lines("PRS"), "at": e["AT"],
+    "agent_pane": e.get("HERDR_PANE_ID", ""),
+}, open(sys.argv[1], "w"), ensure_ascii=False, indent=2)
+PY
+done
+
+# Состояние тоже закрываем: иначе свод показывал бы «работает» с прошлой
+# отметки рядом с готовым маркером.
+here=$(dirname "$0")
+[ -x "$here/worker-state" ] && (cd "${trees[0]}" && "$here/worker-state" "done" "$word" >/dev/null)
+
+echo "$word · $anchor"
+printf '  %s\n' "${pr_lines[@]}"
+echo "  маркер: ${trees[0]}/.anchor/done.json"

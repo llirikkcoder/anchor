@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""
+anchor-merge — проверить PR темы (одиночный или пару фронт+бэк) поверх свежего
+origin/main по гейтам каждого репозитория и слить squash. ТОЛЬКО ОРКЕСТРАТОР:
+воркеру это не ставится; `gh pr merge` ограда воркера не пускает, эту
+команду — пока нет (её список правит оркестратор).
+
+ЗАЧЕМ. Обобщение aio-mergepair: там гейты были вшиты (путь к pytest, список
+известных падений, переменные vitest), и для другого репозитория скрипт
+пришлось бы копировать. Здесь гейты лежат в репозитории — .anchor/gates, —
+а порядок процесса остаётся общим:
+
+  1. Один прогон за раз. Блокировка на машину; второй ждёт. 05.10.2026 два
+     параллельных прогона aio-mergepair делили временные деревья и сорвали
+     друг друга. Порядок важен и по смыслу: вторая тема проверяется поверх
+     main, в который уже влита первая.
+  2. Свежий origin/main + ветка PR во временном дереве на каждый репозиторий.
+     Конфликт — стоп.
+  3. Гейты из .anchor/gates — того, что на origin/main, а не того, что в PR:
+     правка не ослабляет собственную проверку.
+  4. Падение допустимо, только если каждое — из списка известных.
+  5. main уехал за время проверки — стоп: проверено не то, что сольётся.
+  6. Squash с --match-head-commit (сливается ровно проверенный коммит), PR по
+     порядку аргументов. Ветка НЕ удаляется — переименовывается в merged/<ветка>.
+  7. Миграции скрипт не применяет. --migration требует --backup — файл копии
+     базы, снятой ДО применения; без него — отказ.
+
+  anchor-merge <якорь> <репо>:<PR> [<репо>:<PR> …] [ключи]
+      <репо> — основное дерево репозитория на диске
+      --migration <имя> --backup <файл копии>   миграция применена после копии
+      --check-only                              проверить, не сливать
+      --no-rename                               не переименовывать ветки
+
+Итог — код выхода (0 слито / проверено, 1 нет, 2 ошибка вызова) и
+result.json в каталоге журналов (ANCHOR_MERGE_LOGS, по умолчанию
+~/.anchor/merge-logs/<якорь>-<время>/). Ждать окончания — по выходу процесса
+(фоновая команда с уведомлением), а не поиском строки в общем логе: 05.10.2026
+такое ожидание сработало по строке прошлого прогона.
+
+Формат .anchor/gates (ini):
+
+  [gates]
+  base = main                                  # ветка, поверх которой проверять
+  test = .venv/bin/python -m pytest tests -q -p no:cacheprovider
+  test.failures = ^(FAILED|ERROR)\\s           # как найти строку падения в выводе
+  typecheck = node_modules/.bin/tsc -b
+  build = npm run build                        # гейты идут в порядке файла
+
+  [known]                                      # известные падения на main:
+  test_tool_company_binding                    # регулярные выражения по строке
+  test_assistant_events                        # падения, по одному в строке
+
+  [env]                                        # окружение гейтов этого репо;
+  CI = true                                    # {tree:<имя репо>} — временное
+  AI_OFFICE_FRONTEND = {tree:ai-office-frontend}   # дерево соседа по паре,
+                                               # иначе его основное дерево рядом
+  [link]                                       # ссылки во временное дерево
+  node_modules = /home/develop/projects/wt/_shared-front/node_modules
+
+Гейт без <имя>.failures падает на любом ненулевом коде: найти известные
+падения в выводе нечем. Каждая команда идёт через heavy (ANCHOR_HEAVY).
+"""
+import configparser
+import datetime
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+HOME = os.path.expanduser("~")
+HEAVY = os.environ.get("ANCHOR_HEAVY", os.path.join(HERE, "heavy"))
+LOCK = os.environ.get("ANCHOR_MERGE_LOCK", os.path.join(HOME, ".anchor", "merge.lock"))
+LOGS = os.environ.get("ANCHOR_MERGE_LOGS", os.path.join(HOME, ".anchor", "merge-logs"))
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+class Stop(Exception):
+    pass
+
+
+def say(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def run(*cmd, cwd=None, check=True, env=None) -> str:
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env)
+    if check and r.returncode != 0:
+        raise Stop(f"{' '.join(cmd[:4])}…: {(r.stderr or r.stdout).strip()[:400]}")
+    return r.stdout.strip()
+
+
+def slug_of(repo: str) -> str:
+    url = run("git", "-C", repo, "config", "--get", "remote.origin.url")
+    return re.sub(r"\.git$", "", re.sub(r"^(git@[^:]+:|https?://[^/]+/)", "", url))
+
+
+def read_gates(repo: str, base: str) -> configparser.ConfigParser:
+    text = run("git", "-C", repo, "show", f"origin/{base}:.anchor/gates", check=False)
+    if not text:
+        raise Stop(f"{repo}: нет .anchor/gates на origin/{base} — проверять нечем, не сливаю")
+    cp = configparser.ConfigParser(allow_no_value=True, delimiters=("=",), interpolation=None,
+                                   inline_comment_prefixes=("#",))
+    cp.optionxform = str  # имена переменных окружения регистрозависимы
+    cp.read_string(text)
+    if not cp.has_section("gates"):
+        raise Stop(f"{repo}: в .anchor/gates нет секции [gates]")
+    return cp
+
+
+def parse_args(argv: list) -> dict:
+    a = {"items": [], "migration": None, "backup": None, "check_only": False, "rename": True}
+    if len(argv) < 2 or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        sys.exit(0 if argv[:1] in (["-h"], ["--help"]) else 2)
+    a["anchor"] = argv[0]
+    rest = argv[1:]
+    while rest:
+        x = rest.pop(0)
+        if x == "--migration":
+            a["migration"] = rest.pop(0)
+        elif x == "--backup":
+            a["backup"] = rest.pop(0)
+        elif x == "--check-only":
+            a["check_only"] = True
+        elif x == "--no-rename":
+            a["rename"] = False
+        elif re.fullmatch(r".+:\d+", x):
+            repo, pr = x.rsplit(":", 1)
+            a["items"].append({"repo": os.path.realpath(repo), "pr": pr})
+        else:
+            sys.exit(f"anchor-merge: непонятный аргумент {x}")
+    if not a["items"]:
+        sys.exit("anchor-merge: нужен хотя бы один <репо>:<PR>")
+    if a["migration"] and not a["check_only"]:
+        b = a["backup"]
+        if not b or not os.path.isfile(b) or os.path.getsize(b) == 0:
+            sys.exit("anchor-merge: миграция без копии базы — сначала копия (--backup <файл>), потом применение, потом слияние")
+    return a
+
+
+def check_gates(it: dict, trees: dict, logdir: str) -> list:
+    """Прогнать гейты одного репозитория. Возвращает строки отчёта; Stop — провал."""
+    cp, tree, name = it["gates"], it["tree"], it["name"]
+    for dst, src in (cp["link"].items() if cp.has_section("link") else []):
+        p = os.path.join(tree, dst)
+        if not os.path.lexists(p):
+            os.symlink(src, p)
+
+    def subst(v: str) -> str:
+        return re.sub(r"\{tree:([^}]+)\}",
+                      lambda m: trees.get(m.group(1)) or os.path.join(os.path.dirname(it["repo"]), m.group(1)), v)
+
+    env = dict(os.environ)
+    if cp.has_section("env"):
+        env.update({k: subst(v or "") for k, v in cp["env"].items()})
+    known = [re.compile(k) for k in (cp["known"].keys() if cp.has_section("known") else [])]
+    report, bad = [], False
+    for gate, cmd in cp["gates"].items():
+        if gate == "base" or gate.endswith(".failures") or not cmd:
+            continue
+        log = os.path.join(logdir, f"{name}-{gate}.log")
+        with open(log, "w") as f:
+            rc = subprocess.run([HEAVY, "sh", "-c", subst(cmd)], cwd=tree, env=env,
+                                stdout=f, stderr=subprocess.STDOUT).returncode
+        if rc == 0:
+            report.append(f"{name} {gate}: ok")
+            continue
+        out = ANSI.sub("", open(log, errors="replace").read())
+        rx = cp["gates"].get(f"{gate}.failures")
+        fails = [ln for ln in out.splitlines() if rx and re.search(rx, ln)]
+        new = [ln for ln in fails if not any(k.search(ln) for k in known)]
+        if fails and not new:
+            report.append(f"{name} {gate}: только известные падения ({len(fails)})")
+            continue
+        bad = True
+        why = "НОВЫЕ ПАДЕНИЯ" if new else f"код {rc}, строк падений не найдено"
+        report.append(f"{name} {gate}: {why} — {log}")
+        report += [f"    {ln}" for ln in new[:10]]
+    for ln in report:
+        say(ln)
+    if bad:
+        raise Stop(f"{name}: гейты не пройдены")
+    return report
+
+
+def main() -> None:
+    a = parse_args(sys.argv[1:])
+    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+    lock = open(LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        say("anchor-merge: идёт другой прогон — жду его окончания (по одному, не параллельно)")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    logdir = os.path.join(LOGS, f"{a['anchor']}-{stamp}-{os.getpid()}")
+    os.makedirs(logdir, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix=f"anchor-merge-{a['anchor']}-")
+    items, result = a["items"], {"anchor": a["anchor"], "merged": [], "status": "not_merged", "report": []}
+    say(f"================ {a['anchor']} · миграция {a['migration'] or '—'} · журналы {logdir}")
+    try:
+        for it in items:
+            it["name"] = os.path.basename(it["repo"])
+            it["slug"] = slug_of(it["repo"])
+            pr = json.loads(run("gh", "pr", "view", it["pr"], "-R", it["slug"], "--json",
+                                "state,headRefName,headRefOid,baseRefName,isCrossRepository,url"))
+            if pr["state"] != "OPEN":
+                raise Stop(f"{it['slug']}#{it['pr']}: PR {pr['state']}, не открыт")
+            if pr["isCrossRepository"]:
+                raise Stop(f"{it['slug']}#{it['pr']}: PR из форка — сюда не годится")
+            it.update(head=pr["headRefName"], sha=pr["headRefOid"], base=pr["baseRefName"], url=pr["url"])
+            run("git", "-C", it["repo"], "fetch", "-q", "origin")
+            it["gates"] = read_gates(it["repo"], it["base"])
+            want = it["gates"]["gates"].get("base", "main")
+            if it["base"] != want:
+                raise Stop(f"{it['url']}: PR в {it['base']}, а гейты — поверх {want}")
+            it["base_sha"] = run("git", "-C", it["repo"], "rev-parse", f"origin/{it['base']}")
+            it["tree"] = os.path.join(tmp, it["name"])
+            run("git", "-C", it["repo"], "worktree", "add", "-q", "--detach", it["tree"], f"origin/{it['base']}")
+            run("git", "-C", it["tree"], "fetch", "-q", "origin", f"refs/heads/{it['head']}")
+            if run("git", "-C", it["tree"], "rev-parse", "FETCH_HEAD") != it["sha"]:
+                raise Stop(f"{it['url']}: ветка на сервере не совпадает с головой PR — перезапусти")
+            r = subprocess.run(["git", "-C", it["tree"], "merge", "-q", "--no-edit", "FETCH_HEAD"],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                raise Stop(f"{it['name']}: КОНФЛИКТ с origin/{it['base']} — воркеру на ребейз")
+            say(f"{it['name']} #{it['pr']} ({it['head']}) поверх origin/{it['base']} {it['base_sha'][:8]}: слилось")
+
+        trees = {it["name"]: it["tree"] for it in items}
+        for it in items:
+            result["report"] += check_gates(it, trees, logdir)
+
+        if a["check_only"]:
+            result["status"] = "checked"
+            say(f"ИТОГ {a['anchor']}: ПРОВЕРЕНО, не сливал (--check-only)")
+            return
+
+        for it in items:
+            run("git", "-C", it["repo"], "fetch", "-q", "origin")
+            if run("git", "-C", it["repo"], "rev-parse", f"origin/{it['base']}") != it["base_sha"]:
+                raise Stop(f"{it['name']}: origin/{it['base']} уехал за время проверки — перезапусти")
+
+        mig = (f"Миграция {a['migration']} применена к рабочей базе после копии ({a['backup']})."
+               if a["migration"] else "Миграций нет.")
+        gates = "; ".join(ln for ln in result["report"] if not ln.startswith("    "))
+        body = f"{mig} Проверено поверх текущего {items[0]['base']}: {gates}. Якорь {a['anchor']}."
+        for it in items:
+            run("gh", "pr", "merge", it["pr"], "-R", it["slug"], "--squash", "--body", body,
+                "--match-head-commit", it["sha"], check=False)
+            state = run("gh", "pr", "view", it["pr"], "-R", it["slug"], "--json", "state", "-q", ".state", check=False)
+            if state != "MERGED":
+                done = ", ".join(result["merged"]) or "ничего"
+                raise Stop(f"{it['url']}: не слился ({state or 'нет ответа'}); уже слито: {done}")
+            result["merged"].append(it["url"])
+            say(f"СЛИТО {it['name']} #{it['pr']}")
+            # Ветку не удаляем: имя merged/… говорит, чем кончилось, и работа
+            # восстановима. Переименование после слияния PR уже не закрывает.
+            if a["rename"]:
+                r = subprocess.run(["gh", "api", "-X", "POST", f"repos/{it['slug']}/branches/{it['head']}/rename",
+                                    "-f", f"new_name=merged/{it['head']}"], capture_output=True, text=True)
+                say(f"  ветка → merged/{it['head']}" if r.returncode == 0
+                    else f"  ветку переименовать не вышло — сделай руками: {r.stderr.strip()[:200]}")
+        result["status"] = "merged"
+        say(f"ИТОГ {a['anchor']}: СЛИТО")
+    except Stop as e:
+        say(f"СТОП: {e}")
+        word = "СЛИТО ЧАСТИЧНО — разбирать руками" if result["merged"] else "НЕ СЛИТО"
+        if result["merged"]:
+            result["status"] = "partial"
+        say(f"ИТОГ {a['anchor']}: {word}")
+        result["error"] = str(e)
+    finally:
+        for it in items:
+            if it.get("tree") and os.path.isdir(it["tree"]):
+                subprocess.run(["git", "-C", it["repo"], "worktree", "remove", "--force", it["tree"]],
+                               capture_output=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+        with open(os.path.join(logdir, "result.json"), "w") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+    sys.exit(0 if result["status"] in ("merged", "checked") else 1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""
+anchor-queue — очередь запуска тем с потолком числа воркеров.
+
+ЗАЧЕМ (03.10.2026). Десять воркеров разом на 4 ядрах и 8 ГБ: OOM-killer 17
+раз, убиты соседние сервисы. Потолок нашёлся замером — три воркера, — но
+держала его память оркестратора: «запущу следующую, когда кто-то закончит».
+Намерение механизмом не является. Здесь потолок держит очередь: тема ждёт в
+каталоге, пока активных воркеров меньше ANCHOR_MAX.
+
+Без демона: `run` зовёт оркестратор в фоне, и он выходит, когда очередь пуста.
+Второй `run` при живом первом сразу выходит — первый и так подберёт новое.
+
+  anchor-queue add <тема.json>     поставить в очередь (описание — ниже)
+  anchor-queue list                что ждёт, что запущено, что не встало
+  anchor-queue run                 запускать, пока очередь не опустеет
+  anchor-queue run --once          запустить одну (дождавшись места) и выйти —
+                                   оркестратору, чтобы сразу поставить ожидание
+                                   `worker-done --wait <дерево>` на запущенного
+
+Активный воркер — агент herdr с именем на ANCHOR_WORKER_PREFIX (по умолчанию
+«w-»), в дереве которого нет свежего .anchor/done.json. Головы и оркестратор
+префикса не носят и в счёт не идут. Сдавший работу воркер стоит idle и
+процессор не ест — потолок по процессору, а не по памяти (см. SKILL).
+
+ANCHOR_MAX        потолок (по умолчанию 3 — замер на 4 ядрах / 8 ГБ)
+ANCHOR_QUEUE_DIR  каталог очереди (по умолчанию ~/.anchor/queue)
+ANCHOR_POLL       пауза между проверками места, с (по умолчанию 60)
+ANCHOR_GUARD      ограда воркера (по умолчанию ~/.local/bin/anchor-worker-guard);
+                  нет ограды — нет запуска: bypassPermissions без неё запрещён
+
+Описание темы (JSON, пример — templates/topic.example.json):
+  anchor   id якоря                                   обязательно
+  label    подпись вкладки                            по умолчанию — anchor
+  name     имя агента                                 по умолчанию w-<anchor>
+  trees    [{repo, branch, path, base}] — первое дерево рабочее (в нём агент),
+           остальные идут в additionalDirectories     обязательно
+  prompt | prompt_file   постановка                   обязательно
+  beads_dir              по умолчанию <repo первого дерева>/.beads, если есть
+  links    {"node_modules": "/путь"} — ссылки в рабочее дерево
+  disable_plugins        какие плагины выключить (по умолчанию браузер и Telegram)
+"""
+import datetime
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+QDIR = os.environ.get("ANCHOR_QUEUE_DIR", os.path.join(HOME, ".anchor", "queue"))
+MAX = int(os.environ.get("ANCHOR_MAX", "3"))
+POLL = float(os.environ.get("ANCHOR_POLL", "60"))
+PREFIX = os.environ.get("ANCHOR_WORKER_PREFIX", "w-")
+GUARD = os.environ.get("ANCHOR_GUARD", os.path.join(HOME, ".local", "bin", "anchor-worker-guard"))
+HERE = os.path.dirname(os.path.realpath(__file__))
+PLUGINS_OFF = ["chrome-devtools-mcp@claude-plugins-official", "telegram@claude-plugins-official"]
+
+
+class Fail(Exception):
+    pass
+
+
+def log(msg: str) -> None:
+    print(f"{datetime.datetime.now():%H:%M:%S} {msg}", flush=True)
+
+
+def sh(*cmd: str, check: bool = True) -> str:
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise Fail(f"{' '.join(cmd[:4])}…: {(r.stderr or r.stdout).strip()[:300]}")
+    return r.stdout
+
+
+def herdr_json(*args: str) -> dict:
+    out = sh("herdr", *args)
+    try:
+        return json.loads(out)["result"]
+    except Exception:
+        raise Fail(f"herdr {' '.join(args[:2])}: непонятный ответ {out[:200]}")
+
+
+def dirs() -> dict:
+    d = {k: os.path.join(QDIR, k) for k in ("pending", "started", "failed")}
+    for p in d.values():
+        os.makedirs(p, exist_ok=True)
+    return d
+
+
+# --- описание темы --------------------------------------------------------------
+
+def load_topic(path: str) -> dict:
+    try:
+        t = json.load(open(path))
+    except Exception as e:
+        raise Fail(f"{path}: не JSON ({e})")
+    if not re.fullmatch(r"[a-z][a-z0-9]*-[a-z0-9]{3,8}(\.[0-9]+)?", t.get("anchor", "")):
+        raise Fail("anchor: нужен id якоря beads")
+    if not t.get("trees"):
+        raise Fail("trees: нужно хотя бы одно дерево")
+    for tr in t["trees"]:
+        for k in ("repo", "branch", "path"):
+            if not tr.get(k):
+                raise Fail(f"trees: у дерева нет {k}")
+        if tr["branch"] in ("main", "master"):
+            raise Fail("trees: тему не ведут в main")
+        if not os.path.isdir(os.path.join(tr["repo"], ".git")):
+            raise Fail(f"trees: {tr['repo']} — не основное дерево репозитория")
+    if not (t.get("prompt") or t.get("prompt_file")):
+        raise Fail("нужна постановка: prompt или prompt_file")
+    if t.get("prompt_file") and not os.path.isfile(t["prompt_file"]):
+        raise Fail(f"prompt_file: нет {t['prompt_file']}")
+    t.setdefault("name", PREFIX + t["anchor"].replace(".", "-"))
+    t.setdefault("label", t["anchor"])
+    return t
+
+
+# --- счёт активных --------------------------------------------------------------
+
+def done_fresh(tree: str) -> bool:
+    try:
+        dn = json.load(open(os.path.join(tree, ".anchor", "done.json")))
+    except Exception:
+        return False
+    try:
+        st = json.load(open(os.path.join(tree, ".anchor", "state.json")))
+        return st.get("state") == "done" or dn["at"] >= st["at"]
+    except Exception:
+        return True
+
+
+def active_workers() -> list:
+    agents = herdr_json("agent", "list")["agents"]
+    return [a for a in agents
+            if (a.get("name") or "").startswith(PREFIX) and not done_fresh(a.get("cwd") or "")]
+
+
+# --- запуск одной темы ------------------------------------------------------------
+
+def make_tree(tr: dict, label: str, primary: bool):
+    """Дерево и (для рабочего) панель. Возвращает pane_id свободной панели."""
+    path = os.path.abspath(tr["path"])
+    base = tr.get("base", "main")
+    if not primary:
+        if not os.path.isdir(path):
+            sh("git", "-C", tr["repo"], "fetch", "-q", "origin", check=False)
+            exists = subprocess.run(["git", "-C", tr["repo"], "rev-parse", "--verify", "-q", tr["branch"]],
+                                    capture_output=True).returncode == 0
+            sh("git", "-C", tr["repo"], "worktree", "add", "-q", path,
+               *([tr["branch"]] if exists else ["-b", tr["branch"], f"origin/{base}"]))
+        return None
+    # Рабочее дерево — через herdr: тогда у темы есть воркспейс и её видно.
+    ws = [w for w in herdr_json("workspace", "list")["workspaces"]
+          if (w.get("worktree") or {}).get("checkout_path") == path]
+    if not ws:
+        if os.path.isdir(path):
+            r = herdr_json("worktree", "open", "--cwd", tr["repo"], "--path", path, "--label", label, "--no-focus")
+        else:
+            r = herdr_json("worktree", "create", "--cwd", tr["repo"], "--branch", tr["branch"],
+                           "--base", base, "--path", path, "--label", label, "--no-focus")
+        return r["root_pane"]["pane_id"]
+    # Воркспейс пережил агента (рестарт сервера) — второй панели не делим:
+    # два агента в одном дереве — то, от чего спасает каталог на тему.
+    panes = herdr_json("pane", "list", "--workspace", ws[0]["workspace_id"])["panes"]
+    if any(p.get("agent") for p in panes):
+        raise Fail(f"в {path} уже работает агент")
+    return panes[0]["pane_id"]
+
+
+def write_settings(t: dict, tree: str) -> None:
+    """Локальные настройки дерева — ДО старта: читаются при запуске сессии."""
+    d = os.path.join(tree, ".claude")
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, "settings.local.json")
+    try:
+        cfg = json.load(open(p))
+        assert isinstance(cfg, dict)
+    except Exception:
+        cfg = {}
+    repo = t["trees"][0]["repo"]
+    beads = t.get("beads_dir") or (os.path.join(repo, ".beads") if os.path.isdir(os.path.join(repo, ".beads")) else "")
+    if beads:
+        cfg.setdefault("env", {})["BEADS_DIR"] = beads
+    plugins = cfg.setdefault("enabledPlugins", {})
+    for name in t.get("disable_plugins", PLUGINS_OFF):
+        plugins[name] = False
+    cfg["enabledMcpjsonServers"] = []
+    extra = [os.path.abspath(tr["path"]) for tr in t["trees"][1:]]
+    if extra:
+        perms = cfg.setdefault("permissions", {})
+        perms["additionalDirectories"] = sorted(set(perms.get("additionalDirectories", []) + extra))
+    hooks = cfg.setdefault("hooks", {}).setdefault("PreToolUse", [])
+    if not any(h.get("command") == GUARD for m in hooks for h in m.get("hooks", [])):
+        hooks.append({"matcher": "*", "hooks": [{"type": "command", "command": GUARD}]})
+    with open(p, "w") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    # Отслеживаемый файл правку унёс бы в коммит.
+    if subprocess.run(["git", "-C", tree, "ls-files", "--error-unmatch", ".claude/settings.local.json"],
+                      capture_output=True).returncode == 0:
+        sh("git", "-C", tree, "update-index", "--skip-worktree", ".claude/settings.local.json", check=False)
+
+
+def prompt_text(t: dict, tree: str) -> str:
+    body = t.get("prompt") or open(t["prompt_file"]).read()
+    # Хвост одинаков у всех тем — признак готовности задаёт оркестратор заранее,
+    # а не выводит из ответа воркера (SKILL, «Когда считать сделанным»).
+    return (f"{body.strip()}\n\n"
+            f"Состояние отмечай: {HERE}/worker-state working|waiting|stuck \"<причина>\" "
+            f"(waiting — когда ждёшь фоновую команду, лимит или ответ; это не застрял).\n"
+            f"Тесты и сборку — через {HERE}/heavy.\n"
+            f"Слияние, миграции и прод — не твои: их делает оркестратор.\n"
+            f"Закончил — {HERE}/worker-done \"<что сделано и чем проверено>\" "
+            f"(не сделал — с --not-done и причиной). Без этого работа не считается сданной.")
+
+
+def start(t: dict) -> str:
+    if not os.access(GUARD, os.X_OK):
+        raise Fail(f"нет ограды {GUARD} — без неё bypassPermissions не включаем")
+    names = {a.get("name") for a in herdr_json("agent", "list")["agents"]}
+    if t["name"] in names:
+        raise Fail(f"агент {t['name']} уже есть")
+    tree = os.path.abspath(t["trees"][0]["path"])
+    for tr in t["trees"][1:]:
+        make_tree(tr, t["label"], primary=False)
+    # Настройки пишем после дерева, но до агента. Для нового дерева это значит:
+    # create заводит каталог, и сразу же — файл.
+    pane = make_tree(t["trees"][0], t["label"], primary=True)
+    write_settings(t, tree)
+    # Ссылки на окружение — мимо коммита, как и маркеры: воркер с `git add -A`
+    # иначе унесёт в PR ссылку на чужой node_modules.
+    ex = os.path.join(sh("git", "-C", tree, "rev-parse", "--path-format=absolute", "--git-common-dir").strip(),
+                      "info", "exclude")
+    have = open(ex).read().split("\n") if os.path.exists(ex) else []
+    for name, src in (t.get("links") or {}).items():
+        dst = os.path.join(tree, name)
+        if not os.path.lexists(dst):
+            os.symlink(src, dst)
+        if f"/{name}" not in have:
+            os.makedirs(os.path.dirname(ex), exist_ok=True)
+            with open(ex, "a") as f:
+                f.write(f"/{name}\n")
+
+    r = subprocess.run(["herdr", "agent", "start", t["name"], "--kind", "claude", "--pane", pane,
+                        "--", "--permission-mode", "bypassPermissions"], capture_output=True, text=True)
+    if r.returncode != 0:
+        if "agent_not_ready" not in (r.stderr + r.stdout):
+            raise Fail(f"agent start: {(r.stderr or r.stdout).strip()[:300]}")
+        # Ложный отказ: Claude жив, на старте диалог доверия к папке. Дерево
+        # завела сама очередь из репозитория оркестратора — отвечает он
+        # (решение человека 05.10.2026). Чужие каталоги так не открывают.
+        screen = sh("herdr", "pane", "read", pane, "--source", "recent-unwrapped", "--lines", "40", check=False)
+        if re.search(r"trust (this|the) folder", screen, re.I):
+            sh("herdr", "pane", "send-keys", pane, "Down", "Enter")
+            time.sleep(3)
+        agents = herdr_json("agent", "list")["agents"]
+        if not any(a.get("name") == t["name"] for a in agents):
+            sh("herdr", "agent", "rename", pane, t["name"])
+    # Промпт — только готовому агенту; иначе он уйдёт в недорисованный экран.
+    sh("herdr", "agent", "wait", t["name"], "--until", "idle", "--timeout", "120000")
+    sh("herdr", "agent", "prompt", t["name"], prompt_text(t, tree))
+    return tree
+
+
+# --- команды ------------------------------------------------------------------------
+
+def cmd_add(path: str) -> None:
+    t = load_topic(path)
+    d = dirs()
+    dst = os.path.join(d["pending"], f"{datetime.datetime.now():%Y%m%d-%H%M%S}-{t['anchor']}.json")
+    shutil.copy(path, dst)
+    n = len(os.listdir(d["pending"]))
+    print(f"в очереди: {t['anchor']} ({n}-я) → {dst}")
+
+
+def cmd_list() -> None:
+    d = dirs()
+    for k, title in (("pending", "ждут"), ("started", "запущены"), ("failed", "не встали")):
+        items = sorted(os.listdir(d[k]))
+        print(f"{title}: {len(items)}")
+        for f in items[-10:]:
+            print(f"  {f}")
+
+
+def cmd_run(once: bool) -> None:
+    d = dirs()
+    lock = open(os.path.join(QDIR, "run.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("anchor-queue: run уже идёт — он подберёт и новое")
+        return
+    said = False
+    while True:
+        pending = sorted(os.listdir(d["pending"]))
+        if not pending:
+            log("очередь пуста")
+            return
+        try:
+            busy = active_workers()
+        except Fail as e:
+            log(f"herdr не ответил ({e}) — жду")
+            time.sleep(POLL)
+            continue
+        if len(busy) >= MAX:
+            if not said:
+                log(f"заняты {len(busy)} из {MAX}: {', '.join(a['name'] for a in busy)} — жду места")
+                said = True
+            time.sleep(POLL)
+            continue
+        said = False
+        f = pending[0]
+        src = os.path.join(d["pending"], f)
+        try:
+            t = load_topic(src)
+            tree = start(t)
+            os.replace(src, os.path.join(d["started"], f))
+            log(f"ЗАПУЩЕН {t['name']} в {tree} — ждать: {HERE}/worker-done --wait {tree}")
+            if once:
+                return
+        except Fail as e:
+            # Не встала — в сторону с причиной, очередь не держим: следующая
+            # тема не виновата. Повторить — `add` заново после правки.
+            os.replace(src, os.path.join(d["failed"], f))
+            with open(os.path.join(d["failed"], f + ".err"), "w") as fe:
+                fe.write(str(e) + "\n")
+            log(f"НЕ ВСТАЛА {f}: {e}")
+
+
+def main() -> None:
+    a = sys.argv[1:]
+    try:
+        if a[:1] == ["add"] and len(a) == 2:
+            cmd_add(a[1])
+        elif a[:1] == ["list"]:
+            cmd_list()
+        elif a[:1] == ["run"] and a[1:] in ([], ["--once"]):
+            cmd_run(once=a[1:] == ["--once"])
+        else:
+            print(__doc__.strip())
+            sys.exit(0 if a[:1] in ([], ["-h"], ["--help"]) else 2)
+    except Fail as e:
+        sys.exit(f"anchor-queue: {e}")
+
+
+if __name__ == "__main__":
+    main()
