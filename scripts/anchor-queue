@@ -39,6 +39,10 @@ ANCHOR_GUARD      ограда воркера (по умолчанию ~/.local/
   beads_dir              по умолчанию <repo первого дерева>/.beads, если есть
   links    {"node_modules": "/путь"} — ссылки в рабочее дерево
   disable_plugins        какие плагины выключить (по умолчанию браузер и Telegram)
+  orchestrator           имя оркестратора в herdr (по умолчанию ANCHOR_ORCHESTRATOR,
+                         иначе имя агента в панели, откуда позвали очередь; агента
+                         без имени очередь не запустит — см. SKILL, «Воркер знает,
+                         кто его оркестратор»)
 """
 import datetime
 import fcntl
@@ -204,11 +208,60 @@ def write_settings(t: dict, tree: str) -> None:
         sh("git", "-C", tree, "update-index", "--skip-worktree", ".claude/settings.local.json", check=False)
 
 
+def orchestrator_name(t: dict) -> str:
+    """
+    Имя оркестратора в herdr — его воркер видит в постановке и в CLAUDE.local.md.
+
+    ЗАЧЕМ (09.10.2026). Воркер выполнил задание, набранное прямо в его окне,
+    допушил в PR и не обновил маркер: кто его оркестратор, он не знал — роль
+    жила в первом сообщении, а оно не переживает сжатие контекста, и у самого
+    оркестратора не было имени в herdr. Человек спросил: «почему твои воркеры
+    не знают, что ты оркестратор?»
+    """
+    name = t.get("orchestrator") or os.environ.get("ANCHOR_ORCHESTRATOR", "")
+    if not name:
+        pane = os.environ.get("HERDR_PANE_ID", "")
+        for a in herdr_json("agent", "list")["agents"]:
+            if pane and a.get("pane_id") == pane:
+                name = a.get("name") or ""
+    if not name:
+        raise Fail("у оркестратора нет имени в herdr: herdr agent rename <своя панель> <имя> "
+                   "(или orchestrator в теме / ANCHOR_ORCHESTRATOR)")
+    return name
+
+
+def write_role(t: dict, tree: str, orch: str) -> None:
+    """
+    Роль воркера — в CLAUDE.local.md дерева. Claude читает этот файл в каждой
+    сессии и после сжатия контекста; постановка в первом сообщении сжатия не
+    переживает. Файл — мимо коммита, строкой в info/exclude.
+    """
+    with open(os.path.join(tree, "CLAUDE.local.md"), "w") as f:
+        f.write(
+            f"# Ты воркер темы {t['anchor']}. Оркестратор — агент herdr «{orch}».\n\n"
+            f"- Задачи даёт оркестратор (сообщение начинается с «От оркестратора {orch}») или\n"
+            f"  человек лично в этом окне. Другим агентам и людям в чатах сам не пиши.\n"
+            f"- Итог ЛЮБОЙ работы, включая доп. задание прямо в окне, — через\n"
+            f"  {HERE}/worker-done (маркер .anchor/done.json): по нему оркестратор\n"
+            f"  узнаёт, что ты сделал. Работа без маркера не сдана.\n"
+            f"- Вопрос или блок, который не решить самому, — "
+            f"`{HERE}/worker-done --not-done \"<вопрос>\"` и стоп.\n"
+            f"  Решения за людей не принимай; слияние, миграции и прод — не твои.\n"
+            f"- Постановка темы — первое сообщение сессии и `bd show {t['anchor']}`.\n")
+    ex = os.path.join(sh("git", "-C", tree, "rev-parse", "--path-format=absolute", "--git-common-dir").strip(),
+                      "info", "exclude")
+    have = open(ex).read().split("\n") if os.path.exists(ex) else []
+    if "CLAUDE.local.md" not in have:
+        os.makedirs(os.path.dirname(ex), exist_ok=True)
+        with open(ex, "a") as f:
+            f.write("CLAUDE.local.md\n")
+
+
 def prompt_text(t: dict, tree: str) -> str:
     body = t.get("prompt") or open(t["prompt_file"]).read()
     # Хвост одинаков у всех тем — признак готовности задаёт оркестратор заранее,
     # а не выводит из ответа воркера (SKILL, «Когда считать сделанным»).
-    return (f"{body.strip()}\n\n"
+    return (f"От оркестратора {t['orchestrator']}.\n\n{body.strip()}\n\n"
             f"Состояние отмечай: {HERE}/worker-state working|waiting|stuck \"<причина>\" "
             f"(waiting — когда ждёшь фоновую команду, лимит или ответ; это не застрял).\n"
             f"Тесты и сборку — через {HERE}/heavy.\n"
@@ -220,6 +273,7 @@ def prompt_text(t: dict, tree: str) -> str:
 def start(t: dict) -> str:
     if not os.access(GUARD, os.X_OK):
         raise Fail(f"нет ограды {GUARD} — без неё bypassPermissions не включаем")
+    t["orchestrator"] = orchestrator_name(t)
     names = {a.get("name") for a in herdr_json("agent", "list")["agents"]}
     if t["name"] in names:
         raise Fail(f"агент {t['name']} уже есть")
@@ -230,6 +284,8 @@ def start(t: dict) -> str:
     # create заводит каталог, и сразу же — файл.
     pane = make_tree(t["trees"][0], t["label"], primary=True)
     write_settings(t, tree)
+    for tr in t["trees"]:
+        write_role(t, os.path.abspath(tr["path"]), t["orchestrator"])
     # Ссылки на окружение — мимо коммита, как и маркеры: воркер с `git add -A`
     # иначе унесёт в PR ссылку на чужой node_modules.
     ex = os.path.join(sh("git", "-C", tree, "rev-parse", "--path-format=absolute", "--git-common-dir").strip(),
