@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""
+anchor-status — одна таблица вместо трёх источников: кто из воркеров что
+держит и что у него готово к сдаче.
+
+ЗАЧЕМ. `herdr agent list` отвечает на вопрос «кто есть», и отвечает верно. Но
+оркестратору нужен другой: «у кого лежит работа, которую я ещё не забрал».
+09.10.2026 работа трижды находилась в дереве ПОСЛЕ того, как тема считалась
+закрытой: воркер доделал и не сказал, межсессионное сообщение не дошло,
+оркестратор видел «idle» и шёл дальше. Один раз это была готовая правка,
+найденная случайно при уборке деревьев.
+
+Разойтись могут именно три источника, и порознь каждый говорит правду:
+  herdr   — какие панели живы и чем заняты
+  git     — что лежит в деревьях: несливённое и незакоммиченное
+  EvaTeam — в каком состоянии тикет
+
+Скрипт их сводит. Ничего не меняет: только читает.
+
+КОГДА СМОТРЕТЬ
+  — перед закрытием темы (шаг 4 из пяти: «дерево убрано»);
+  — раз в час-полтора работы с несколькими воркерами;
+  — всегда, когда кажется, что воркер молчит.
+
+Запуск:  anchor-status            из каталога репозитория
+         anchor-status --wt ПУТЬ  если деревья лежат не рядом
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+def run(cmd, cwd=None, timeout=20):
+    try:
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                           timeout=timeout)
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def herdr_agents():
+    """Живые панели: имя → каталог. Пустой словарь, если herdr недоступен."""
+    out = run(["herdr", "agent", "list"])
+    if not out:
+        return {}
+    try:
+        d = json.loads(out)
+    except json.JSONDecodeError:
+        return {}
+    rows = d.get("result", {}).get("agents", d) if isinstance(d, dict) else d
+    res = {}
+    for a in rows if isinstance(rows, list) else []:
+        name = a.get("name")
+        if name:
+            res[name] = {"cwd": a.get("cwd", ""),
+                         "status": a.get("agent_status", "?")}
+    return res
+
+
+def tree_state(path):
+    """Что лежит в дереве: несливённое и незакоммиченное.
+
+    Несливённое считается относительно origin/main, а не локального main:
+    локальный может опережать удалённый на несколько слияний, и тогда
+    «не слито 0» означало бы лишь «я это уже забрал», а не «оно уехало».
+    """
+    branch = run(["git", "branch", "--show-current"], cwd=path)
+    unmerged = run(["git", "log", "origin/main..HEAD", "--oneline"], cwd=path)
+    dirty = run(["git", "status", "--porcelain"], cwd=path)
+    # Файлы роли и выгрузки эксперта за работу не считаем: они живут в дереве
+    # по замыслу и мусором не являются.
+    skip = re.compile(r"CLAUDE\.local\.md|\.xlsx$|\.json$")
+    dirty_n = len([l for l in dirty.splitlines() if l and not skip.search(l)])
+    return {
+        "branch": branch or "—",
+        "unmerged": len(unmerged.splitlines()) if unmerged else 0,
+        "dirty": dirty_n,
+    }
+
+
+def ticket_status(code, gt_dir):
+    """Состояние тикета в EvaTeam. Пусто, если скилл недоступен."""
+    if not code or not gt_dir.exists():
+        return ""
+    code_py = (
+        "import os,sys;"
+        "from dotenv import load_dotenv;"
+        "load_dotenv('.env');sys.path.insert(0,'.');"
+        "from main import rpc;"
+        f"t=rpc('CmfTask.list', code='{code}', fields=['cache_status_type']);"
+        "print(t[0]['cache_status_type'] if t else '')"
+    )
+    return run([sys.executable, "-c", code_py], cwd=gt_dir, timeout=25)
+
+
+def main():
+    repo = Path.cwd()
+    wt_root = None
+    if "--wt" in sys.argv:
+        wt_root = Path(sys.argv[sys.argv.index("--wt") + 1])
+    else:
+        guess = repo.parent / (repo.name.split("-")[0] + "-wt")
+        wt_root = guess if guess.exists() else repo.parent
+
+    gt_dir = repo / "get-tickets"
+    agents = herdr_agents()
+
+    rows = []
+    seen_paths = set()
+
+    for name, info in sorted(agents.items()):
+        cwd = info["cwd"]
+        if not cwd or not Path(cwd).exists() or cwd == str(repo):
+            continue
+        seen_paths.add(cwd)
+        st = tree_state(cwd)
+        m = re.search(r"AS-\d+", st["branch"]) or re.search(r"AS-\d+", name.upper())
+        code = m.group(0) if m else ""
+        rows.append({
+            "worker": name,
+            "branch": st["branch"],
+            "unmerged": st["unmerged"],
+            "dirty": st["dirty"],
+            "status": info["status"],
+            "ticket": code,
+        })
+
+    # Деревья без воркера: работа в них есть, а сказать о ней некому.
+    orphans = []
+    if wt_root.exists():
+        for d in sorted(wt_root.iterdir()):
+            if not d.is_dir() or str(d) in seen_paths:
+                continue
+            if not (d / ".git").exists():
+                continue
+            st = tree_state(d)
+            if st["unmerged"] or st["dirty"]:
+                orphans.append({"path": d.name, **st})
+
+    if not rows and not orphans:
+        print("Воркеров нет, деревьев с работой нет.")
+        return
+
+    # Статусы тикетов спрашиваем только там, где есть что забирать: запрос
+    # к EvaTeam не быстрый, а для пустых деревьев ответ ничего не меняет.
+    for r in rows:
+        if r["unmerged"] or r["dirty"]:
+            r["ticket_status"] = ticket_status(r["ticket"], gt_dir)
+        else:
+            r["ticket_status"] = ""
+
+    w = max([len(r["worker"]) for r in rows] + [12])
+    b = max([len(r["branch"][:26]) for r in rows] + [10])
+    print(f"{'воркер':<{w}}  {'ветка':<{b}}  не слито  не закоммич  состояние  тикет")
+    print("─" * (w + b + 44))
+    for r in rows:
+        mark = "←" if (r["unmerged"] or r["dirty"]) else " "
+        tk = f"{r['ticket']} {r['ticket_status']}".strip()
+        print(f"{r['worker']:<{w}}  {r['branch'][:26]:<{b}}  "
+              f"{r['unmerged']:>8}  {r['dirty']:>11}  {r['status']:<9}  {tk} {mark}")
+
+    if orphans:
+        print()
+        print("ДЕРЕВЬЯ БЕЗ ВОРКЕРА — работа есть, сказать о ней некому:")
+        for o in orphans:
+            print(f"  {o['path']:<30} не слито {o['unmerged']}, "
+                  f"не закоммичено {o['dirty']}")
+
+    pending = [r for r in rows if r["unmerged"]]
+    if pending:
+        print()
+        print(f"ЗАБРАТЬ: {', '.join(r['worker'] for r in pending)}")
+
+
+if __name__ == "__main__":
+    main()
