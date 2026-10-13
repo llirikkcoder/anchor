@@ -27,7 +27,7 @@ ANCHOR_MAX        потолок (по умолчанию 3 — замер на 
 ANCHOR_QUEUE_DIR  каталог очереди (по умолчанию ~/.anchor/queue)
 ANCHOR_POLL       пауза между проверками места, с (по умолчанию 60)
 ANCHOR_GUARD      ограда воркера (по умолчанию ~/.local/bin/anchor-worker-guard);
-                  нет ограды — нет запуска: bypassPermissions без неё запрещён
+                  нет ограды — нет запуска: --dangerously-skip-permissions без неё запрещён
 
 Описание темы (JSON, пример — templates/topic.example.json):
   anchor   id якоря                                   обязательно
@@ -272,7 +272,7 @@ def prompt_text(t: dict, tree: str) -> str:
 
 def start(t: dict) -> str:
     if not os.access(GUARD, os.X_OK):
-        raise Fail(f"нет ограды {GUARD} — без неё bypassPermissions не включаем")
+        raise Fail(f"нет ограды {GUARD} — без неё --dangerously-skip-permissions не включаем")
     t["orchestrator"] = orchestrator_name(t)
     names = {a.get("name") for a in herdr_json("agent", "list")["agents"]}
     if t["name"] in names:
@@ -301,7 +301,7 @@ def start(t: dict) -> str:
                 f.write(f"/{name}\n")
 
     r = subprocess.run(["herdr", "agent", "start", t["name"], "--kind", "claude", "--pane", pane,
-                        "--", "--permission-mode", "bypassPermissions"], capture_output=True, text=True)
+                        "--", "--dangerously-skip-permissions"], capture_output=True, text=True)
     if r.returncode != 0:
         if "agent_not_ready" not in (r.stderr + r.stdout):
             raise Fail(f"agent start: {(r.stderr or r.stdout).strip()[:300]}")

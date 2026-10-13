@@ -212,7 +212,7 @@ anchor-queue list
 постановка (`prompt` или `prompt_file`), `beads_dir`, ссылки на окружение.
 Запуск делает ровно то, что описано выше: дерево через `herdr worktree
 create`, `settings.local.json` до старта (BEADS_DIR, ограда, лишние плагины
-выключены), `agent start … -- --permission-mode bypassPermissions`, ответ на
+выключены), `agent start … -- --dangerously-skip-permissions`, ответ на
 диалог доверия для своего дерева, переименование при ложном
 `agent_not_ready`, постановка с хвостом про `worker-state`, `heavy` и
 `worker-done`. Нет ограды — тема не запускается.
@@ -229,18 +229,22 @@ create`, `settings.local.json` до старта (BEADS_DIR, ограда, ли�
 
 Воркер, который спрашивает разрешение на каждую команду, простаивает, пока
 вопрос не заметят (03.10.2026: «стоял на вопросе, пока его не заметили»). С
-05.10.2026 по решению человека воркеры работают в режиме `bypassPermissions`,
+05.10.2026 по решению человека воркеры работают без вопросов о разрешении,
 а необратимое держит не вопрос, а ограда — хук `PreToolUse`
 (`scripts/worker-guard` этого плагина). Хуки срабатывают и тогда, когда
 разрешения не спрашиваются: проверено 05.10.2026, `gh pr merge` в таком режиме
 остановлен хуком, обычная запись файла прошла без вопроса.
+
+14.10.2026 по решению владельца ключ запуска сменён с `--permission-mode
+bypassPermissions` на `--dangerously-skip-permissions` — ограда и её гарантии
+(хуки срабатывают независимо от режима разрешений) не меняются.
 
 Режим задаётся **флагом запуска**, а не настройкой: `"defaultMode":
 "bypassPermissions"` в `settings.local.json` дерева не сработал — сессия
 продолжила спрашивать.
 
 ```bash
-herdr agent start as2119 --kind claude --pane "$pane" -- --permission-mode bypassPermissions
+herdr agent start as2119 --kind claude --pane "$pane" -- --dangerously-skip-permissions
 ```
 
 Ограда — в тот же `settings.local.json` дерева, до старта, **абсолютным
