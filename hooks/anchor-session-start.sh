@@ -195,8 +195,10 @@ esac
 if [ -z "$anchor" ]; then
   if [ "$here" = "$root" ] && command -v herdr >/dev/null 2>&1; then
     printf '\n🎛  Основное дерево — оркестрация. Процедура темы: навык `anchor` (/anchor)\n'
-    printf '   Дерево и вкладку заводит herdr, а не git напрямую:\n'
-    printf '     herdr worktree create --branch <ветка> --base main\n'
+    printf '   ПРАВИЛО 1: воркер — линией ПОД этим пространством, иначе его не видно:\n'
+    printf '     git worktree add -b <ветка> <абс.путь> origin/main\n'
+    printf '     herdr worktree open --workspace "$HERDR_WORKSPACE_ID" --path <абс.путь> --label <якорь>\n'
+    printf '   Не --cwd, не worktree create, не workspace create.\n'
     printf '   Работу соседу отдают тоже через herdr — тогда её видно в списке:\n'
     printf '     herdr agent list · herdr agent prompt <id> "…"\n'
   fi

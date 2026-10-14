@@ -7,6 +7,11 @@
 — эпику или задаче; ветка, worktree и вкладка [herdr](https://herdr.dev)
 производны от него.
 
+> **Правило 1.** Воркер открывается линией под пространством оркестратора:
+> `git worktree add …` и `herdr worktree open --workspace "$HERDR_WORKSPACE_ID" --path <дерево>`.
+> Не `--cwd`, не `worktree create`, не `workspace create` — иначе воркер встаёт
+> отдельно в конец списка и его не находят. Подробно — в начале `skills/anchor/SKILL.md`.
+
 ## Зачем
 
 За один день работы в четыре параллельные сессии: `main` трижды уехал под

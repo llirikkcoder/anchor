@@ -144,6 +144,23 @@ def active_workers() -> list:
 
 # --- запуск одной темы ------------------------------------------------------------
 
+def parent_workspace(repo: str) -> str:
+    """Пространство оркестратора, под которым вешается тема (правило 1).
+
+    Сначала — то, где сидит оркестратор (`HERDR_WORKSPACE_ID` в его окружении,
+    очередь запускает он). Иначе — пространство основного дерева репозитория.
+    Не нашли — тему не запускаем: отдельное пространство без линии хуже отказа.
+    """
+    wid = os.environ.get("HERDR_WORKSPACE_ID")
+    if wid:
+        return wid
+    root = os.path.abspath(repo)
+    for w in herdr_json("workspace", "list")["workspaces"]:
+        if (w.get("worktree") or {}).get("checkout_path") == root:
+            return w["workspace_id"]
+    raise Fail(f"нет пространства оркестратора для {root}: правило 1 — тема ставится только под ним")
+
+
 def make_tree(tr: dict, label: str, primary: bool):
     """Дерево и (для рабочего) панель. Возвращает pane_id свободной панели."""
     path = os.path.abspath(tr["path"])
@@ -160,11 +177,18 @@ def make_tree(tr: dict, label: str, primary: bool):
     ws = [w for w in herdr_json("workspace", "list")["workspaces"]
           if (w.get("worktree") or {}).get("checkout_path") == path]
     if not ws:
-        if os.path.isdir(path):
-            r = herdr_json("worktree", "open", "--cwd", tr["repo"], "--path", path, "--label", label, "--no-focus")
-        else:
-            r = herdr_json("worktree", "create", "--cwd", tr["repo"], "--branch", tr["branch"],
-                           "--base", base, "--path", path, "--label", label, "--no-focus")
+        # ПРАВИЛО 1 (SKILL.md): дерево — git'ом, пространство — `worktree open
+        # --workspace <оркестратор>`. С --cwd или `worktree create` тема вставала
+        # отдельным пространством в конец списка, без линии к оркестратору, и
+        # человек её не находил (14.10.2026).
+        if not os.path.isdir(path):
+            sh("git", "-C", tr["repo"], "fetch", "-q", "origin", check=False)
+            exists = subprocess.run(["git", "-C", tr["repo"], "rev-parse", "--verify", "-q", tr["branch"]],
+                                    capture_output=True).returncode == 0
+            sh("git", "-C", tr["repo"], "worktree", "add", "-q", path,
+               *([tr["branch"]] if exists else ["-b", tr["branch"], f"origin/{base}"]))
+        r = herdr_json("worktree", "open", "--workspace", parent_workspace(tr["repo"]),
+                       "--path", path, "--label", label, "--no-focus", "--trust-repository")
         return r["root_pane"]["pane_id"]
     # Воркспейс пережил агента (рестарт сервера) — второй панели не делим:
     # два агента в одном дереве — то, от чего спасает каталог на тему.
