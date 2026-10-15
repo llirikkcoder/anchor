@@ -216,10 +216,16 @@ anchor-queue list
 постановка (`prompt` или `prompt_file`), `beads_dir`, ссылки на окружение.
 Запуск делает ровно то, что описано выше: дерево через `herdr worktree
 create`, `settings.local.json` до старта (BEADS_DIR, ограда, лишние плагины
-выключены), `agent start … -- --dangerously-skip-permissions`, ответ на
+выключены), `agent start … -- --dangerously-skip-permissions --model sonnet`, ответ на
 диалог доверия для своего дерева, переименование при ложном
 `agent_not_ready`, постановка с хвостом про `worker-state`, `heavy` и
 `worker-done`. Нет ограды — тема не запускается.
+
+Воркеры работают на **Sonnet** (решение владельца 15.10.2026): задача воркера
+узкая и описана постановкой, целиком тему держит оркестратор. Другая модель на
+один запуск — `ANCHOR_WORKER_MODEL=opus anchor-queue …`; пустое значение —
+модель по умолчанию. Подагенты, которых оркестратор зовёт сам (Agent), — тоже
+с `model: sonnet`, если задача не требует иного.
 
 Активный воркер — агент с именем на `w-` без свежего маркера готовности;
 головы и оркестратор в счёт не идут. Потолок — `ANCHOR_MAX` (по умолчанию 3).
@@ -248,7 +254,7 @@ bypassPermissions` на `--dangerously-skip-permissions` — ограда и е�
 продолжила спрашивать.
 
 ```bash
-herdr agent start as2119 --kind claude --pane "$pane" -- --dangerously-skip-permissions
+herdr agent start as2119 --kind claude --pane "$pane" -- --dangerously-skip-permissions --model sonnet
 ```
 
 Ограда — в тот же `settings.local.json` дерева, до старта, **абсолютным

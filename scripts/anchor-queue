@@ -324,8 +324,13 @@ def start(t: dict) -> str:
             with open(ex, "a") as f:
                 f.write(f"/{name}\n")
 
+    # Воркеры — на Sonnet (решение человека 15.10.2026): работа воркера узкая и
+    # описана задачей, а думает за всю тему оркестратор. Другую модель на один
+    # запуск — ANCHOR_WORKER_MODEL (например opus); пусто — модель по умолчанию.
+    model = os.environ.get("ANCHOR_WORKER_MODEL", "sonnet").strip()
     r = subprocess.run(["herdr", "agent", "start", t["name"], "--kind", "claude", "--pane", pane,
-                        "--", "--dangerously-skip-permissions"], capture_output=True, text=True)
+                        "--", "--dangerously-skip-permissions", *(["--model", model] if model else [])],
+                       capture_output=True, text=True)
     if r.returncode != 0:
         if "agent_not_ready" not in (r.stderr + r.stdout):
             raise Fail(f"agent start: {(r.stderr or r.stdout).strip()[:300]}")
