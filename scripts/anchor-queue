@@ -328,8 +328,15 @@ def start(t: dict) -> str:
     # описана задачей, а думает за всю тему оркестратор. Другую модель на один
     # запуск — ANCHOR_WORKER_MODEL (например opus); пусто — модель по умолчанию.
     model = os.environ.get("ANCHOR_WORKER_MODEL", "sonnet").strip()
+    # Советник (advisor tool, 16.10.2026): воркер на Sonnet сам зовёт Opus в
+    # узловых точках — перед подходом, при застревании, перед «готово». Opus
+    # думает за всю тему, но платим за него только в эти моменты. Пара проверена
+    # запуском `claude -p --model sonnet --advisor opus`. Выключить —
+    # ANCHOR_WORKER_ADVISOR= (пусто), другая модель — ANCHOR_WORKER_ADVISOR=<имя>.
+    advisor = os.environ.get("ANCHOR_WORKER_ADVISOR", "opus").strip()
+    extra = [*(["--model", model] if model else []), *(["--advisor", advisor] if advisor else [])]
     r = subprocess.run(["herdr", "agent", "start", t["name"], "--kind", "claude", "--pane", pane,
-                        "--", "--dangerously-skip-permissions", *(["--model", model] if model else [])],
+                        "--", "--dangerously-skip-permissions", *extra],
                        capture_output=True, text=True)
     if r.returncode != 0:
         if "agent_not_ready" not in (r.stderr + r.stdout):

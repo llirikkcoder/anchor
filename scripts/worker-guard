@@ -17,7 +17,9 @@
 - секреты (~/.secrets, .env с ключами) и прямой доступ к рабочей базе;
 - деплой в прод, sudo, установка системных пакетов;
 - закрытие чужих панелей и деревьев herdr, удаление задач beads;
-- rm -rf вне своего дерева.
+- rm -rf вне своего дерева;
+- pkill/killall (16.10.2026 воркер убил по шаблону чужие прогоны тестов);
+- правка файлов в ~/Projects вне своих деревьев (<якорь>-back, <якорь>-front).
 
 Список — регулярные выражения ниже. Ложный отказ дешевле, чем ложный пропуск:
 воркер, упёршийся в ограду, напишет оркестратору, а оркестратор сделает это
@@ -52,6 +54,7 @@ BASH_DENY = [
     (r"\bgit\s+worktree\s+(remove|prune)\b", "деревья убирает оркестратор"),
     (r"\bgit\s+branch\s+-[dD]\b", "удаление веток — оркестратор"),
     (r"worker-guard|settings(\.local)?\.json|\.claude/hooks|\.claude\.json", "ограду и настройки Claude правит только оркестратор"),
+    (r"(^|[;&|]\s*|\s)(pkill|killall)\b", "pkill/killall бьют по шаблону и задевают чужие процессы — останавливай свой процесс по pid"),
     (r"\bcrontab\b|\bsystemctl\s+(start|stop|restart|enable|disable)\b", "службы машины"),
 ]
 
@@ -89,6 +92,27 @@ def rm_outside_tree(cmd: str, cwd: str) -> bool:
     return False
 
 
+def edit_outside_trees(path: str, cwd: str) -> bool:
+    """
+    Запись в ~/Projects вне своих деревьев. Свои: рабочее дерево (cwd) и
+    соседи с тем же якорем — wt/<якорь>-back и wt/<якорь>-front. Вне ~/Projects
+    (/tmp, ~/.claude/plans и т.п.) не ограничиваем: там чужой работы нет.
+    """
+    projects = os.path.realpath(os.path.expanduser("~/Projects"))
+    target = os.path.realpath(os.path.join(cwd, path))
+    if not target.startswith(projects + os.sep):
+        return False
+    root = os.path.realpath(cwd)
+    свои = [root]
+    имя = os.path.basename(root)
+    for хвост in ("-back", "-front"):
+        if имя.endswith(хвост):
+            якорь = имя[: -len(хвост)]
+            родитель = os.path.dirname(root)
+            свои += [os.path.join(родитель, якорь + "-back"), os.path.join(родитель, якорь + "-front")]
+    return not any(target == r or target.startswith(r + os.sep) for r in свои)
+
+
 def main() -> None:
     try:
         data = json.load(sys.stdin)
@@ -115,6 +139,8 @@ def main() -> None:
             for pattern, reason in WRITE_DENY:
                 if re.search(pattern, path):
                     deny(reason)
+            if path and edit_outside_trees(path, cwd):
+                deny("правка вне своих деревьев — чужая работа")
 
 
 if __name__ == "__main__":
