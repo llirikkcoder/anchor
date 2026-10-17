@@ -12,14 +12,20 @@
 и идёт другим путём или пишет оркестратору.
 
 ЧТО ЗАКРЫТО — только необратимое и чужое, не обычная работа:
-- слияние PR, релизы, удаление репозиториев и веток на сервере;
+- релизы, удаление репозиториев и веток на сервере;
 - push в main/master и push --force без --force-with-lease;
-- секреты (~/.secrets, .env с ключами) и прямой доступ к рабочей базе;
+- секреты (~/.secrets, .env с ключами) и чтение копий базы;
 - деплой в прод, sudo, установка системных пакетов;
 - закрытие чужих панелей и деревьев herdr, удаление задач beads;
 - rm -rf вне своего дерева;
 - pkill/killall (16.10.2026 воркер убил по шаблону чужие прогоны тестов);
 - правка файлов в ~/Projects вне своих деревьев (<якорь>-back, <якорь>-front).
+
+СЛИЯНИЕ PR И МИГРАЦИИ ВОРКЕРУ ОТКРЫТЫ (решение владельца 18.10.2026): воркер,
+сдавший зелёный PR, сам вливает свежий main, гоняет тесты и сливает; миграцию
+применяет после копии базы (scripts/db_backup.sh) через сессионный порт 5432.
+Ограда этот порядок проверить не может — его держит постановка воркера
+(anchor-queue, prompt_text). Деплой и переменные прода остаются закрыты.
 
 Список — регулярные выражения ниже. Ложный отказ дешевле, чем ложный пропуск:
 воркер, упёршийся в ограду, напишет оркестратору, а оркестратор сделает это
@@ -28,11 +34,10 @@
 import json
 import os
 import re
+import subprocess
 import sys
 
 BASH_DENY = [
-    (r"\bgh\s+pr\s+merge\b", "слияние PR делает оркестратор после своей проверки"),
-    (r"(^|[\s;&|/])anchor-merge(\s|$)", "слияние PR делает оркестратор после своей проверки"),
     (r"\banchor-queue\s+run\b", "запуск воркеров из очереди — оркестратор"),
     (r"\bgh\s+release\s+(create|delete|edit)\b", "релиз — решение человека"),
     (r"\bgh\s+repo\s+(delete|archive|rename|edit)\b", "репозиторий — решение человека"),
@@ -42,9 +47,8 @@ BASH_DENY = [
     (r"\bgit\s+push\b[^|;&]*(--delete|\s:[\w./-]+)", "удаление ветки на сервере"),
     (r"\.secrets\b", "секреты — только у оркестратора"),
     (r"db_full_backup|(^|[\s/])backups/\S*\.sql", "копии базы содержат данные клиентов — только у оркестратора"),
-    (r"\bDATABASE_URL\b|\bSUPABASE_SERVICE(_ROLE)?_KEY\b", "ключи рабочей базы — только у оркестратора"),
-    (r"\b(psql|pg_dump|pg_restore)\b|postgres:\d+-alpine", "прямой доступ к рабочей базе — только у оркестратора"),
-    (r"\bsupabase\s+(db|migration)\b", "миграции применяет оркестратор после копии базы"),
+    # pg_restore поверх рабочей базы необратим — его по-прежнему делает человек.
+    (r"\bpg_restore\b", "восстановление базы из копии — решение человека"),
     (r"\b(railway|vercel)\b[^|;&]*(\s)(up|deploy|--prod|redeploy|variables\s+set)(\s|$)", "деплой и переменные прода — решение человека"),
     (r"(^|[;&|]\s*)sudo\b", "sudo"),
     (r"\b(apt|apt-get|dnf|yum|snap)\s+(install|remove|purge)\b", "системные пакеты"),
@@ -53,7 +57,9 @@ BASH_DENY = [
     (r"\bbd\s+delete\b", "удалять задачи beads — оркестратор"),
     (r"\bgit\s+worktree\s+(remove|prune)\b", "деревья убирает оркестратор"),
     (r"\bgit\s+branch\s+-[dD]\b", "удаление веток — оркестратор"),
-    (r"worker-guard|settings(\.local)?\.json|\.claude/hooks|\.claude\.json", "ограду и настройки Claude правит только оркестратор"),
+    # Только запись в эти файлы, а не любое упоминание: 18.10.2026 воркер получил
+    # отказ на worker-state, потому что в тексте причины встретилось имя ограды.
+    (r"(>|\btee\b|\bsed\s+-i|\bcp\b|\bmv\b|\brm\b|\bln\b|\bchmod\b)[^|;&]*(worker-guard|settings(\.local)?\.json|\.claude/hooks|\.claude\.json)", "ограду и настройки Claude правит только оркестратор"),
     (r"(^|[;&|]\s*|\s)(pkill|killall)\b", "pkill/killall бьют по шаблону и задевают чужие процессы — останавливай свой процесс по pid"),
     (r"\bcrontab\b|\bsystemctl\s+(start|stop|restart|enable|disable)\b", "службы машины"),
 ]
@@ -92,6 +98,25 @@ def rm_outside_tree(cmd: str, cwd: str) -> bool:
     return False
 
 
+def _корень_дерева(cwd: str) -> str:
+    """
+    Корень рабочего дерева, а не текущий каталог сессии.
+
+    18.10.2026 воркер сделал cd в подкаталог src/…, и «своим деревом» для ограды
+    стал этот подкаталог: запись в tests/ того же дерева получила «правка вне
+    своих деревьев», воркер встал на полчаса. Корень берём у git
+    (--show-toplevel); вне git — сам cwd, как было.
+    """
+    try:
+        r = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return os.path.realpath(r.stdout.strip())
+    except Exception:
+        pass
+    return os.path.realpath(cwd)
+
+
 def edit_outside_trees(path: str, cwd: str) -> bool:
     """
     Запись в ~/Projects вне своих деревьев. Свои: рабочее дерево (cwd) и
@@ -102,7 +127,7 @@ def edit_outside_trees(path: str, cwd: str) -> bool:
     target = os.path.realpath(os.path.join(cwd, path))
     if not target.startswith(projects + os.sep):
         return False
-    root = os.path.realpath(cwd)
+    root = _корень_дерева(cwd)
     свои = [root]
     имя = os.path.basename(root)
     for хвост in ("-back", "-front"):
