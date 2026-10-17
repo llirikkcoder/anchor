@@ -28,6 +28,7 @@
 import json
 import os
 import re
+import subprocess
 import sys
 
 BASH_DENY = [
@@ -92,6 +93,25 @@ def rm_outside_tree(cmd: str, cwd: str) -> bool:
     return False
 
 
+def _корень_дерева(cwd: str) -> str:
+    """
+    Корень рабочего дерева, а не текущий каталог сессии.
+
+    18.10.2026 воркер сделал cd в подкаталог src/…, и «своим деревом» для ограды
+    стал этот подкаталог: запись в tests/ того же дерева получила «правка вне
+    своих деревьев», воркер встал на полчаса. Корень берём у git
+    (--show-toplevel); вне git — сам cwd, как было.
+    """
+    try:
+        r = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return os.path.realpath(r.stdout.strip())
+    except Exception:
+        pass
+    return os.path.realpath(cwd)
+
+
 def edit_outside_trees(path: str, cwd: str) -> bool:
     """
     Запись в ~/Projects вне своих деревьев. Свои: рабочее дерево (cwd) и
@@ -102,7 +122,7 @@ def edit_outside_trees(path: str, cwd: str) -> bool:
     target = os.path.realpath(os.path.join(cwd, path))
     if not target.startswith(projects + os.sep):
         return False
-    root = os.path.realpath(cwd)
+    root = _корень_дерева(cwd)
     свои = [root]
     имя = os.path.basename(root)
     for хвост in ("-back", "-front"):
