@@ -98,6 +98,10 @@ env = cfg.setdefault("env", {})
 if env.get("BEADS_DIR") != os.environ["BEADS_DIR_VALUE"]:
     env["BEADS_DIR"] = os.environ["BEADS_DIR_VALUE"]
     changed = True
+# Свой Dolt-сервер дереву не нужен: см. anchor-queue (write_settings), 18.10.2026.
+if env.get("BEADS_DOLT_AUTO_START") != "0":
+    env["BEADS_DOLT_AUTO_START"] = "0"
+    changed = True
 
 # $CLAUDE_PROJECT_DIR в команде хука → абсолютный путь основного дерева.
 # Трогаем только те команды, где подстановка ведёт к несуществующему файлу:

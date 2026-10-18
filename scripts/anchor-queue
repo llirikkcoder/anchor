@@ -211,7 +211,11 @@ def write_settings(t: dict, tree: str) -> None:
     repo = t["trees"][0]["repo"]
     beads = t.get("beads_dir") or (os.path.join(repo, ".beads") if os.path.isdir(os.path.join(repo, ".beads")) else "")
     if beads:
-        cfg.setdefault("env", {})["BEADS_DIR"] = beads
+        cfg.setdefault("env", {})["BEADS_DIR"] = os.path.abspath(beads)
+        # bd в дереве не поднимает свой Dolt-сервер (18.10.2026: 79 осиротевших
+        # sql-server от убранных деревьев). С верным BEADS_DIR он ходит в сервер
+        # основного дерева; с неверным — пусть падает громко, а не плодит процессы.
+        cfg["env"]["BEADS_DOLT_AUTO_START"] = "0"
     plugins = cfg.setdefault("enabledPlugins", {})
     for name in t.get("disable_plugins", PLUGINS_OFF):
         plugins[name] = False
