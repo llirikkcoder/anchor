@@ -25,7 +25,15 @@
 сдавший зелёный PR, сам вливает свежий main, гоняет тесты и сливает; миграцию
 применяет после копии базы (scripts/db_backup.sh) через сессионный порт 5432.
 Ограда этот порядок проверить не может — его держит постановка воркера
-(anchor-queue, prompt_text). Деплой и переменные прода остаются закрыты.
+(anchor-queue, prompt_text).
+
+ДЕПЛОЙ ПО СПИСКУ (решение владельца 18.10.2026). Воркер, слив PR, упирался в
+запрет `railway up` для telegram-bot — сервиса, который сам из main не
+выкатывается, — и выкат ждал человека. Теперь `railway up <дерево> --service S`
+пропускается, если S есть в ~/.anchor/deploy_allow (по сервису в строке, его
+ведёт владелец) и дерево стоит ровно на origin/main без правок: выкатить можно
+только уже слитое. Переменные прода, vercel, другие сервисы и выкат ветки
+закрыты по-прежнему; сам список воркеру не записать (WRITE_DENY, BASH_DENY).
 
 Список — регулярные выражения ниже. Ложный отказ дешевле, чем ложный пропуск:
 воркер, упёршийся в ограду, напишет оркестратору, а оркестратор сделает это
@@ -50,6 +58,9 @@ BASH_DENY = [
     # pg_restore поверх рабочей базы необратим — его по-прежнему делает человек.
     (r"\bpg_restore\b", "восстановление базы из копии — решение человека"),
     (r"\b(railway|vercel)\b[^|;&]*(\s)(up|deploy|--prod|redeploy|variables\s+set)(\s|$)", "деплой и переменные прода — решение человека"),
+    # 18.10.2026: `railway variables --set A=1` проходил — шаблон выше знал только
+    # форму «variables set». Любая запись и удаление переменных — человеку.
+    (r"\b(railway|vercel)\b[^|;&]*\b(variables?|env)\b[^|;&]*(--set|\s(set|add|rm|remove|delete|unset)\b)", "переменные прода — решение человека"),
     (r"(^|[;&|]\s*)sudo\b", "sudo"),
     (r"\b(apt|apt-get|dnf|yum|snap)\s+(install|remove|purge)\b", "системные пакеты"),
     (r"\bherdr\s+(workspace|pane|tab|worktree)\s+(close|remove|delete|move)\b", "раскладку herdr меняет оркестратор"),
@@ -60,6 +71,7 @@ BASH_DENY = [
     # Только запись в эти файлы, а не любое упоминание: 18.10.2026 воркер получил
     # отказ на worker-state, потому что в тексте причины встретилось имя ограды.
     (r"(>|\btee\b|\bsed\s+-i|\bcp\b|\bmv\b|\brm\b|\bln\b|\bchmod\b)[^|;&]*(worker-guard|settings(\.local)?\.json|\.claude/hooks|\.claude\.json)", "ограду и настройки Claude правит только оркестратор"),
+    (r"(>|\btee\b|\bsed\s+-i|\bcp\b|\bmv\b|\brm\b|\bln\b|\bchmod\b)[^|;&]*deploy_allow", "список разрешённого деплоя ведёт только владелец"),
     (r"(^|[;&|]\s*|\s)(pkill|killall)\b", "pkill/killall бьют по шаблону и задевают чужие процессы — останавливай свой процесс по pid"),
     (r"\bcrontab\b|\bsystemctl\s+(start|stop|restart|enable|disable)\b", "службы машины"),
 ]
@@ -67,6 +79,7 @@ BASH_DENY = [
 # Правка ограды и настроек Claude: из режима без вопросов воркер иначе мог бы
 # снять хук с себя — настройки Claude Code перечитывает на ходу.
 WRITE_DENY = [
+    (r"(^|/)\.anchor/deploy_allow$", "список разрешённого деплоя ведёт только владелец"),
     (r"worker-guard$", "ограду правит только оркестратор"),
     (r"(^|/)\.claude/(settings(\.local)?\.json|hooks/)", "настройки Claude правит только оркестратор"),
     (r"(^|/)\.claude\.json$", "настройки Claude правит только оркестратор"),
@@ -138,6 +151,58 @@ def edit_outside_trees(path: str, cwd: str) -> bool:
     return not any(target == r or target.startswith(r + os.sep) for r in свои)
 
 
+DEPLOY_ALLOW_FILE = os.path.expanduser("~/.anchor/deploy_allow")
+DEPLOY_CMD = re.compile(
+    r"^\s*(?:cd\s+\S+\s*&&\s*)?railway\s+up\s+(?P<path>\S+)\s+(?P<flags>(?:--?[\w-]+(?:\s+(?![-])\S+)?\s*)+)$")
+
+
+def allowed_services() -> set[str]:
+    try:
+        with open(DEPLOY_ALLOW_FILE, encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip() and not line.startswith("#")}
+    except OSError:
+        return set()
+
+
+def _git(tree: str, *args: str) -> str:
+    r = subprocess.run(["git", "-C", tree, *args], capture_output=True, text=True, timeout=20)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def deploy_allowed(cmd: str, cwd: str) -> bool:
+    """
+    `railway up <tree> --service S [--path-as-root] [--detach]` одной командой.
+
+    Пропускаем, только если S в списке владельца, а дерево — чистый origin/main:
+    HEAD совпадает с origin/main после fetch и нет незакоммиченных правок. Любая
+    цепочка (`;`, `|`, второе `&&`) — отказ: в неё можно спрятать что угодно.
+    """
+    if re.search(r"[;|`$<>]", cmd) or cmd.count("&&") > 1:
+        return False
+    m = DEPLOY_CMD.match(cmd)
+    if not m:
+        return False
+    flags = m.group("flags").split()
+    if "--service" not in flags or flags.count("--service") != 1:
+        return False
+    i = flags.index("--service")
+    service = flags[i + 1] if i + 1 < len(flags) else ""
+    rest = flags[:i] + flags[i + 2:]
+    if service not in allowed_services() or any(f not in ("--path-as-root", "--detach") for f in rest):
+        return False
+    base = cwd
+    cd = re.match(r"^\s*cd\s+(\S+)\s*&&", cmd)
+    if cd:
+        base = os.path.join(cwd, os.path.expanduser(cd.group(1)))
+    tree = os.path.realpath(os.path.join(base, os.path.expanduser(m.group("path"))))
+    if not os.path.isdir(tree):
+        return False
+    subprocess.run(["git", "-C", tree, "fetch", "-q", "origin", "main"], capture_output=True, timeout=60)
+    head, main = _git(tree, "rev-parse", "HEAD"), _git(tree, "rev-parse", "origin/main")
+    dirty = subprocess.run(["git", "-C", tree, "diff", "--quiet", "HEAD"], capture_output=True).returncode != 0
+    return bool(head) and head == main and not dirty
+
+
 def main() -> None:
     try:
         data = json.load(sys.stdin)
@@ -149,6 +214,8 @@ def main() -> None:
 
     if tool == "Bash":
         cmd = inp.get("command", "")
+        if deploy_allowed(cmd, cwd):
+            return
         for pattern, reason in BASH_DENY:
             if re.search(pattern, cmd):
                 deny(reason)
