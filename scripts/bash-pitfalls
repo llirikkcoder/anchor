@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+"""
+Хук PreToolUse(Bash) воркеров anchor (из прототипа ai-office aio-cadj, docs/research/agent-pitfalls-prototypes/bash_hook).
+
+РЕЖИМ (решение владельца 19.10.2026): только для воркеров anchor и сначала ТОЛЬКО СЧЁТ.
+ANCHOR_BASH_PITFALLS=count (по умолчанию) — находки пишутся в ~/.anchor/bash-pitfalls.jsonl,
+команда не блокируется; =block — отказ кодом 2, как в прототипе. Через месяц по журналу
+решаем, включать ли блок.
+
+Исходный текст прототипа:
+ для сессий агентов: два правила из CLAUDE.md,
+которые держались только прозой.
+
+ФОРМАТ ХУКА (сверен по ~/.claude/hooks/block-destructive.sh и ограде воркера
+anchor/scripts/worker-guard): JSON со stdin — {"tool_name": "Bash",
+"tool_input": {"command": "..."}, "cwd": "..."}; отказ — код 2 и причина в
+stderr (Claude её видит); любой другой исход — разрешено.
+
+ПРАВИЛО A. «Проверка не считается пройденной, если её код возврата потерян»
+(CLAUDE.md, правка 221a618c). `cmd | tail -3; echo $?` измеряет tail, а не cmd.
+Блокируем, когда первый этап конвейера похож на проверку (pytest, tsc, build,
+drift.sh…), а следующая команда читает `$?`. Остальное (`cat f | head; echo $?`)
+только считается — вид `A_status_lost_any`, не блокируется.
+  Исключения: `set -o pipefail`/`setopt pipefail`, `${PIPESTATUS[..]}` и
+  `${pipestatus[..]}` (zsh), последний этап — `grep -q/-c` (измеряют именно его).
+  Отдельный вид `A2_and_echo` (`pytest | tail && echo ok`): та же ошибка без `$?`,
+  только считается.
+
+ПРАВИЛО B. «git stash pop в общем дереве вытаскивает чужое» (CLAUDE.md,
+правка fc6c4647). Стек stash общий для всех деревьев и сессий: голый `pop`,
+`apply`, `drop`, `clear` или адрес `stash@{n}` берут верхнюю/по номеру запись,
+которая может быть чужой. Разрешено: `apply <sha>` (запись найдена по метке) и
+любая форма, если в команде есть поиск своей записи — `git stash list … | grep …`
+(как в CLAUDE.md). `git stash push` без `-m` только считается (`B2_…`): без метки
+свою запись потом не найти.
+
+РАЗБОР — НАСТОЯЩИЙ, А НЕ grep ПО СТРОКЕ. Команды содержат heredoc'и, текст
+коммитов в кавычках («git stash pop» внутри -m "…" — сам коммит fc6c4647!) и
+`grep -E 'a|b'`: построчный regex на них ошибался бы. Ниже — маленький лексер
+оболочки: кавычки, экранирование, `$(...)`, обратные кавычки, heredoc, операторы.
+
+ЧЕГО ХУК НЕ ДЕЛАЕТ: не разбирает `bash -c "…"`, функции, алиасы, `eval`; код
+возврата, прочитанный В СЛЕДУЮЩЕМ вызове Bash, не виден вовсе — хук видит одну
+команду за раз.
+"""
+from __future__ import annotations
+
+import json
+import os
+import time
+import re
+import sys
+from dataclasses import dataclass, field
+from typing import Optional
+
+# ── Лексер оболочки ─────────────────────────────────────────────────────────
+
+
+@dataclass
+class Tok:
+    kind: str                   # "word" | "op"
+    text: str                   # слово без кавычек; подстановка схлопнута в «$(…)»
+    status_ref: bool = False    # в слове есть $? или ${?} вне одинарных кавычек
+    sub_pipeline: bool = False  # внутри $(…) или `…` есть конвейер из ≥2 этапов
+    inner: str = ""             # исходный текст подстановок слова (для оценки «похоже на проверку»)
+
+
+WORD_ENDERS = set(";|&()\n")
+HEREDOC_WORD = re.compile(r"^(\d*)<<(-?)(.*)$", re.S)
+SIMPLE_VAR = re.compile(r"\$(\w+|[!$@*#-])")
+
+
+def find_closing(s: str, i: int, opener: str, closer: str) -> int:
+    """Индекс парной скобки; i — первый символ ПОСЛЕ открывающей. -1, если не закрыта."""
+    depth = 1
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            j = s.find("'", i + 1)
+            if j < 0:
+                return -1
+            i = j + 1
+            continue
+        if c == '"':
+            i += 1
+            while i < n and s[i] != '"':
+                i += 2 if s[i] == "\\" else 1
+            i += 1
+            continue
+        if c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+class Lexer:
+    def __init__(self, s: str) -> None:
+        self.s = s
+        self.i = 0
+        self.n = len(s)
+        self.toks: list[Tok] = []
+        self.subs: list[list[Tok]] = []   # токены вложенных $(…) и `…`, плоским списком
+        self._heredocs: list[tuple[str, bool]] = []
+        self._inners: list[str] = []      # тексты подстановок текущего слова
+
+    def run(self) -> "Lexer":
+        s = self.s
+        while self.i < self.n:
+            c = s[self.i]
+            if c in " \t":
+                self.i += 1
+            elif c == "\n":
+                self.toks.append(Tok("op", "\n"))
+                self.i += 1
+                self._eat_heredocs()
+            elif c == "\\" and s.startswith("\\\n", self.i):
+                self.i += 2
+            elif c == "#":
+                while self.i < self.n and s[self.i] != "\n":
+                    self.i += 1
+            elif c == ";":
+                self.i += 2 if s.startswith(";;", self.i) else 1
+                self.toks.append(Tok("op", ";"))
+            elif c == "|":
+                if s.startswith("||", self.i):
+                    self.toks.append(Tok("op", "||"))
+                    self.i += 2
+                else:                           # `|` и `|&` — одинаково конвейер
+                    self.toks.append(Tok("op", "|"))
+                    self.i += 2 if s.startswith("|&", self.i) else 1
+            elif c == "&" and s.startswith("&&", self.i):
+                self.toks.append(Tok("op", "&&"))
+                self.i += 2
+            elif c == "&" and not s.startswith("&>", self.i):
+                self.toks.append(Tok("op", "&"))
+                self.i += 1
+            elif c in "()":
+                self.toks.append(Tok("op", c))
+                self.i += 1
+            else:
+                start = self.i
+                word = self._word()
+                if self.i == start:      # страховка от зацикливания на неожиданном символе
+                    self.i += 1
+                    continue
+                m = HEREDOC_WORD.match(word.text)
+                if m and not word.text.startswith("<<<"):
+                    delimiter = m.group(3)
+                    if not delimiter:    # `<<` и разделитель отдельным словом
+                        while self.i < self.n and s[self.i] in " \t":
+                            self.i += 1
+                        delimiter = self._word().text
+                    self._heredocs.append((delimiter, m.group(2) == "-"))
+                else:
+                    self.toks.append(word)
+        return self
+
+    def _eat_heredocs(self) -> None:
+        """Тело heredoc — не команды: пропускаем до строки-разделителя."""
+        for delimiter, strip_tabs in self._heredocs:
+            while self.i < self.n:
+                end = self.s.find("\n", self.i)
+                line = self.s[self.i: end if end >= 0 else self.n]
+                self.i = end + 1 if end >= 0 else self.n
+                if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                    break
+        self._heredocs.clear()
+
+    def _word(self) -> Tok:
+        s, n = self.s, self.n
+        out: list[str] = []
+        status = False
+        sub_pipe = False
+        self._inners = []
+        while self.i < n:
+            c = s[self.i]
+            if c in " \t" or c in WORD_ENDERS:
+                # `2>&1`, `>&2`, `&>f`: & рядом с > или < — часть перенаправления
+                if c == "&" and ((out and out[-1][-1:] in "<>") or s.startswith("&>", self.i)):
+                    out.append(c)
+                    self.i += 1
+                    continue
+                break
+            if c == "\\":
+                if self.i + 1 < n and s[self.i + 1] != "\n":
+                    out.append(s[self.i + 1])
+                self.i += 2
+            elif c == "'":
+                j = s.find("'", self.i + 1)
+                j = n if j < 0 else j
+                out.append(s[self.i + 1: j])
+                self.i = j + 1
+            elif c == '"':
+                self.i += 1
+                while self.i < n and s[self.i] != '"':
+                    d = s[self.i]
+                    if d == "\\" and self.i + 1 < n:
+                        out.append(s[self.i + 1] if s[self.i + 1] in '$"\\`' else d + s[self.i + 1])
+                        self.i += 2
+                    elif d in "$`":
+                        st, sp, txt = self._expansion()
+                        status, sub_pipe = status or st, sub_pipe or sp
+                        out.append(txt)
+                    else:
+                        out.append(d)
+                        self.i += 1
+                self.i += 1
+            elif c in "$`":
+                st, sp, txt = self._expansion()
+                status, sub_pipe = status or st, sub_pipe or sp
+                out.append(txt)
+            else:
+                out.append(c)
+                self.i += 1
+        return Tok("word", "".join(out), status, sub_pipe, "\n".join(self._inners))
+
+    def _expansion(self) -> tuple[bool, bool, str]:
+        """Разобрать $…, `…` с s[i]. Вернуть (status_ref, sub_pipeline, текст)."""
+        s = self.s
+        if s[self.i] == "`":
+            j = s.find("`", self.i + 1)
+            if j < 0:
+                self.i = self.n
+                return False, False, "`"
+            inner = s[self.i + 1: j]
+            self.i = j + 1
+            return self._nested(inner)
+        nxt = s[self.i + 1: self.i + 2]
+        if nxt == "?":
+            self.i += 2
+            return True, False, "$?"
+        if s.startswith("$((", self.i):
+            j = find_closing(s, self.i + 2, "(", ")")
+            self.i = (self.n if j < 0 else j + 1)
+            return False, False, "$((…))"
+        if nxt == "(":
+            j = find_closing(s, self.i + 2, "(", ")")
+            if j < 0:
+                self.i = self.n
+                return False, False, "$("
+            inner = s[self.i + 2: j]
+            self.i = j + 1
+            return self._nested(inner)
+        if nxt == "{":
+            j = find_closing(s, self.i + 2, "{", "}")
+            if j < 0:
+                self.i = self.n
+                return False, False, "${"
+            inner = s[self.i + 2: j]
+            self.i = j + 1
+            return inner == "?", False, "${" + inner + "}"
+        m = SIMPLE_VAR.match(s, self.i)
+        if m:
+            self.i = m.end()
+            return False, False, m.group(0)
+        self.i += 1
+        return False, False, "$"
+
+    def _nested(self, inner: str) -> tuple[bool, bool, str]:
+        self._inners.append(inner)
+        sub = Lexer(inner).run()
+        self.subs.append(sub.toks)
+        self.subs.extend(sub.subs)
+        has_pipe = any(len(u.stages) >= 2 for u in split_units(sub.toks))
+        return False, has_pipe, "$(…)"
+
+
+# ── Единицы: команды и конвейеры ────────────────────────────────────────────
+
+
+@dataclass
+class Unit:
+    conn: str                                    # оператор перед единицей: "", ";", "&&", "||", "&", "\n", "(", ")"
+    stages: list[list[Tok]] = field(default_factory=list)   # этапы конвейера, в каждом слова
+
+
+def split_units(toks: list[Tok]) -> list[Unit]:
+    units: list[Unit] = []
+    conn = ""
+    current: list[Tok] = []
+    stages: list[list[Tok]] = []
+
+    def close() -> None:
+        nonlocal current, stages
+        if current:
+            stages.append(current)
+        if stages:
+            units.append(Unit(conn, stages))
+        current, stages = [], []
+
+    for t in toks:
+        if t.kind == "word":
+            current.append(t)
+        elif t.text == "|":
+            if current:
+                stages.append(current)
+            current = []
+        else:
+            close()
+            conn = t.text
+    close()
+    return units
+
+
+SKIPPED_PREFIXES = {"time", "!", "env", "command", "nohup", "exec", "builtin", "sudo"}
+REDIRECT_ALONE = re.compile(r"\d*(>>?|<|&>>?|>&)")
+REDIRECT_ATTACHED = re.compile(r"^\d*(>>?|<|&>>?|>&)\S")
+
+
+def command_words(stage: list[Tok]) -> list[str]:
+    """Слова этапа без присваиваний, префиксов (time, env…) и перенаправлений."""
+    words: list[str] = []
+    skip_target = False
+    for t in stage:
+        x = t.text
+        if skip_target:
+            skip_target = False
+            continue
+        if REDIRECT_ALONE.fullmatch(x):
+            skip_target = True
+            continue
+        if REDIRECT_ATTACHED.match(x):
+            continue
+        if not words and (re.match(r"^\w+=", x) or x in SKIPPED_PREFIXES):
+            continue
+        words.append(x)
+    return words
+
+
+# ── Правило A: код возврата потерян в конвейере ─────────────────────────────
+
+CHECK_COMMAND = re.compile(
+    r"(\bpytest\b|-m\s+pytest|\bpy\.test\b|\btsc\b|\bvite\b|\bvitest\b|\bjest\b|\beslint\b|"
+    r"\bplaywright\b|\bruff\b|\bpyright\b|\bmypy\b|\bflake8\b|"
+    r"\bnpm\s+(run\s+)?(build|test|lint|typecheck)\b|\bnpx\s+(tsc|vite|vitest|jest|eslint|playwright)\b|"
+    r"\bcargo\s+(test|build|check|clippy)\b|\bgo\s+(test|build|vet)\b|\bmake\b|"
+    r"drift\.sh|typecheck|scripts/heavy|\bevals\b|check_[a-z0-9_]+\.py|run_tests)")
+
+FILTERS = {"tail", "head", "grep", "egrep", "sed", "awk", "tee", "cat", "wc", "sort", "uniq",
+           "cut", "less", "more", "jq", "tr", "xargs", "nl", "column", "fmt"}
+
+
+def last_stage_is_measured(stage: list[Tok]) -> bool:
+    """`grep -q/-c`, `test`, `[` — код последнего этапа тут и нужен."""
+    words = command_words(stage)
+    if not words:
+        return False
+    if words[0] in ("grep", "egrep", "fgrep", "rg"):
+        return any(re.fullmatch(r"-[A-Za-z]*[qc][A-Za-z]*", w) or w in ("--quiet", "--count", "--silent")
+                   for w in words[1:])
+    return words[0] in ("test", "[", "[[")
+
+
+def shape(unit: Unit, nxt: Unit) -> str:
+    """Обезличенная форма находки: имена команд и флаги, без путей и текста."""
+    parts = []
+    for st in unit.stages:
+        w = command_words(st) or ["…"]
+        flags = "".join(" " + x for x in w[1:3] if x.startswith("-"))
+        parts.append(w[0] + flags + (" …" if len(w) > 1 else ""))
+    reads = "$?" if any(t.status_ref for s in nxt.stages for t in s) else "echo"
+    return " | ".join(parts) + f" {nxt.conn} <читает {reads}>"
+
+
+def rule_a(toks: list[Tok], all_words: list[str]) -> list[tuple[str, str]]:
+    """Конвейер, за которым идёт чтение `$?`. Вернуть [(вид, форма)]."""
+    if any(re.search(r"\bpipefail\b", w) for w in all_words):
+        return []
+    found: list[tuple[str, str]] = []
+    units = split_units(toks)
+    for i in range(len(units) - 1):
+        u, nxt = units[i], units[i + 1]
+        is_pipeline = len(u.stages) >= 2
+        # `out=$(pytest | tail)`: статус присваивания — статус подстановки
+        assign_only = len(u.stages) == 1 and all(re.match(r"^\w+=", t.text) for t in u.stages[0])
+        if not is_pipeline and not (assign_only and any(t.sub_pipeline for t in u.stages[0])):
+            continue
+        if any("PIPESTATUS" in t.text or "pipestatus" in t.text for st in nxt.stages for t in st):
+            continue
+        if is_pipeline and last_stage_is_measured(u.stages[-1]):
+            continue
+        # «Похоже на проверку» судим по словам команды, а не по свободному тексту в кавычках:
+        # `worker-done "тесты, drift.sh зелёный" | tail` — это не запуск drift.sh.
+        first = (" ".join(w for w in command_words(u.stages[0]) if not re.search(r"\s", w)) if is_pipeline
+                 else " ".join(t.inner for t in u.stages[0]))
+        looks_like_check = bool(CHECK_COMMAND.search(first))
+        reads_status = any(t.status_ref for st in nxt.stages for t in st)
+        if reads_status:
+            found.append(("A_status_lost" if looks_like_check else "A_status_lost_any", shape(u, nxt)))
+        elif (is_pipeline and looks_like_check and nxt.conn in ("&&", "||")
+              and command_words(nxt.stages[0])[:1] in (["echo"], ["printf"])
+              and (command_words(u.stages[-1]) or [""])[0] in FILTERS):
+            found.append(("A2_and_echo", shape(u, nxt)))
+    return found
+
+
+# ── Правило B: git stash без своей метки ────────────────────────────────────
+
+GIT_GLOBAL_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}
+HEX_SHA = re.compile(r"^[0-9a-f]{7,40}$")
+STASH_INDEX = re.compile(r"^stash@\{\d+\}$|^\d+$")
+
+
+def git_stash(words: list[str]) -> Optional[tuple[str, list[str]]]:
+    """Если команда — `git [опции] stash <sub> args`, вернуть (sub, args); иначе None."""
+    if not words or words[0] != "git":
+        return None
+    i = 1
+    while i < len(words) and words[i].startswith("-"):
+        i += 1 + (1 if words[i] in GIT_GLOBAL_WITH_VALUE else 0)
+    if i >= len(words) or words[i] != "stash":
+        return None
+    rest = words[i + 1:]
+    if rest and not rest[0].startswith("-"):
+        return rest[0], rest[1:]
+    return "push", rest                      # голый `git stash` — это push
+
+
+def has_marker_lookup(lists: list[list[Tok]]) -> bool:
+    """Где-то в команде есть `git stash list … | grep …` — поиск своей записи по метке."""
+    for toks in lists:
+        for u in split_units(toks):
+            for k, st in enumerate(u.stages):
+                w = command_words(st)
+                is_list = w[:1] == ["git"] and "stash" in w[:6] and "list" in w[:8]
+                if is_list and any((command_words(x) or [""])[0] in ("grep", "egrep", "rg", "awk", "fgrep")
+                                   for x in u.stages[k + 1:]):
+                    return True
+    return False
+
+
+def rule_b(toks: list[Tok], marker_lookup: bool) -> list[tuple[str, str]]:
+    found: list[tuple[str, str]] = []
+    for u in split_units(toks):
+        for st in u.stages:
+            r = git_stash(command_words(st))
+            if r is None:
+                continue
+            sub, args = r
+            if sub in ("push", "save"):
+                has_message = any(a in ("-m", "--message") or a.startswith("--message=")
+                                  or (a.startswith("-m") and len(a) > 2) for a in args)
+                if sub == "push" and not has_message:
+                    found.append(("B2_stash_push_unnamed", "git stash push без -m"))
+                elif sub == "save" and not args:
+                    found.append(("B2_stash_push_unnamed", "git stash save без сообщения"))
+                continue
+            if sub not in ("pop", "apply", "drop", "clear"):
+                continue
+            positional = [a for a in args if not a.startswith("-")]
+            ref = positional[0] if positional else ""
+            if sub != "clear":
+                if sub == "apply" and HEX_SHA.match(ref.strip("\"'")):
+                    continue                    # запись найдена по sha
+                if marker_lookup:
+                    continue                    # своя запись искалась по метке
+            shape_ = f"git stash {sub}" + (" stash@{n}" if STASH_INDEX.match(ref) else (" <ref>" if ref else ""))
+            found.append((f"B_stash_{sub}", shape_))
+    return found
+
+
+# ── Всё вместе ──────────────────────────────────────────────────────────────
+
+BLOCKING = {"A_status_lost", "B_stash_pop", "B_stash_apply", "B_stash_drop", "B_stash_clear"}
+
+
+@dataclass
+class Finding:
+    kind: str
+    shape: str
+
+    @property
+    def blocks(self) -> bool:
+        return self.kind in BLOCKING
+
+
+def check(command: str) -> list[Finding]:
+    lex = Lexer(command).run()
+    lists = [lex.toks, *lex.subs]
+    all_words = [t.text for lst in lists for t in lst if t.kind == "word"]
+    marker = has_marker_lookup(lists)
+    result: list[Finding] = []
+    for lst in lists:
+        for kind, shape_ in rule_a(lst, all_words) + rule_b(lst, marker):
+            result.append(Finding(kind, shape_))
+    return result
+
+
+def has_own_push(command: str) -> bool:
+    """В той же команде есть `git stash` / `git stash push|save` — откладывают и достают за один вызов."""
+    lex = Lexer(command).run()
+    for toks in [lex.toks, *lex.subs]:
+        for u in split_units(toks):
+            for st in u.stages:
+                r = git_stash(command_words(st))
+                if r is not None and r[0] in ("push", "save"):
+                    return True
+    return False
+
+
+MESSAGE_A = (
+    "ОСТАНОВЛЕНО (правило CLAUDE.md «Проверка не считается пройденной, если её код возврата потерян»): "
+    "после конвейера `$?` — это код последней команды (tail/head/grep), а не проверки. "
+    "Пиши вывод в файл и смотри код отдельно: `cmd > /tmp/out.txt 2>&1; echo $?`; "
+    "либо `set -o pipefail`; либо ${pipestatus[1]} (zsh) / ${PIPESTATUS[0]} (bash)."
+)
+MESSAGE_B = (
+    "ОСТАНОВЛЕНО (правило CLAUDE.md «git stash pop в общем дереве вытаскивает чужое»): стек stash общий для "
+    "всех деревьев и сессий, голый pop/apply/drop/clear или stash@{n} берёт чужую запись. "
+    "Лучше не откладывать, а сделать WIP-коммит. Если откладываешь: `git stash push -u -m \"<метка>\"`, "
+    "найди запись по метке (`git stash list --format='%H %gs'`) и верни `git stash apply <sha>`."
+)
+
+
+def run_hook(stdin_text: str) -> tuple[int, str]:
+    """(код выхода, текст для stderr). Поломка самого хука — разрешить: он не должен глушить работу."""
+    try:
+        data = json.loads(stdin_text)
+        if str(data.get("tool_name") or "") != "Bash":
+            return 0, ""
+        command = (data.get("tool_input") or {}).get("command") or ""
+        blocking = [f for f in check(command) if f.blocks]
+    except Exception as e:  # noqa: BLE001
+        return 0, f"agent_bash_guard: сбой разбора, команда пропущена: {e}"
+    if not blocking:
+        return 0, ""
+    messages = []
+    if any(f.kind == "A_status_lost" for f in blocking):
+        messages.append(MESSAGE_A)
+    if any(f.kind.startswith("B_stash") for f in blocking):
+        messages.append(MESSAGE_B)
+    shapes = "; ".join(sorted({f.shape for f in blocking}))
+    return 2, "\n".join(messages) + f"\nНайдено: {shapes}"
+
+
+def count_only(stdin_text: str) -> None:
+    """Режим «только счёт»: находки — в журнал, команда идёт дальше."""
+    try:
+        data = json.loads(stdin_text or "{}")
+        command = (data.get("tool_input") or {}).get("command", "")
+        findings = check(command) if data.get("tool_name") == "Bash" else []
+        if not findings:
+            return
+        log_path = os.path.expanduser("~/.anchor/bash-pitfalls.jsonl")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as log:
+            for finding in findings:
+                log.write(json.dumps({
+                    "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "cwd": data.get("cwd", ""), "kind": finding.kind,
+                    "would_block": finding.blocks, "shape": finding.shape,
+                }, ensure_ascii=False) + "\n")
+    except Exception:
+        # Хук не должен глушить работу: сбой счёта — молча мимо, это только статистика.
+        pass
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 2 and sys.argv[1] == "--explain":
+        for f in check(sys.argv[2]):
+            print(("БЛОК " if f.blocks else "счёт ") + f.kind, "::", f.shape)
+        sys.exit(0)
+    stdin_text = sys.stdin.read()
+    if os.environ.get("ANCHOR_BASH_PITFALLS", "count") != "block":
+        count_only(stdin_text)
+        sys.exit(0)
+    code, text = run_hook(stdin_text)
+    if text:
+        print(text, file=sys.stderr)
+    sys.exit(code)

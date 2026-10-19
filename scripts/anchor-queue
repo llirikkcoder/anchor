@@ -227,6 +227,12 @@ def write_settings(t: dict, tree: str) -> None:
     hooks = cfg.setdefault("hooks", {}).setdefault("PreToolUse", [])
     if not any(h.get("command") == GUARD for m in hooks for h in m.get("hooks", [])):
         hooks.append({"matcher": "*", "hooks": [{"type": "command", "command": GUARD}]})
+    # Счёт ловушек Bash (потерянный код возврата в конвейере, голый stash pop):
+    # только воркеры и только счёт — решение владельца 19.10.2026, см. bash-pitfalls.
+    pitfalls = os.path.join(HERE, "bash-pitfalls")
+    if os.access(pitfalls, os.X_OK) and not any(
+            h.get("command") == pitfalls for m in hooks for h in m.get("hooks", [])):
+        hooks.append({"matcher": "Bash", "hooks": [{"type": "command", "command": pitfalls}]})
     with open(p, "w") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
         f.write("\n")
