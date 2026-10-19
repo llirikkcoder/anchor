@@ -164,7 +164,10 @@ for t in "${trees[@]}"; do
     head=$(git -C "$t" rev-parse HEAD)
     merged=$(gh pr list -R "$slug" --head "$rb" --state merged --json url,headRefOid \
       -q ".[] | select(.headRefOid == \"$head\") | .url" 2>/dev/null | head -1)
-    [ -n "$merged" ] && die "$t: этот коммит уже слит ($merged) — сдавать нечего"
+    # Слитый PR — это сданная работа, а не ошибка. 18–19.10.2026 здесь стоял die:
+    # воркер, сам слив свой PR (так велит постановка), оставался без итога в
+    # якоре и без маркера, и оркестратор трижды за день считал его незакончившим.
+    if [ -n "$merged" ]; then pr_lines+=("$merged (уже слит)"); continue; fi
   fi
   if [ -z "$pr" ]; then
     [ "$status" = "done" ] || { pr_lines+=("$slug: PR не открыт (не сделано)"); continue; }
