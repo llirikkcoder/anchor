@@ -152,6 +152,7 @@ def edit_outside_trees(path: str, cwd: str) -> bool:
 
 
 DEPLOY_ALLOW_FILE = os.path.expanduser("~/.anchor/deploy_allow")
+DEPLOY_TAIL = re.compile(r"\s*(?:2>&1)?\s*(?:\|\s*(?:tail|head)(?:\s+-n)?\s+-?\d+)?\s*$")
 DEPLOY_CMD = re.compile(
     r"^\s*(?:cd\s+\S+\s*&&\s*)?railway\s+up\s+(?P<path>\S+)\s+(?P<flags>(?:--?[\w-]+(?:\s+(?![-])\S+)?\s*)+)$")
 
@@ -177,6 +178,9 @@ def deploy_allowed(cmd: str, cwd: str) -> bool:
     HEAD совпадает с origin/main после fetch и нет незакоммиченных правок. Любая
     цепочка (`;`, `|`, второе `&&`) — отказ: в неё можно спрятать что угодно.
     """
+    # Хвост, который только режет вывод, безопасен: 19.10.2026 воркер дописал
+    # `2>&1 | tail -5`, и выкат по списку получил общий отказ «решение человека».
+    cmd = DEPLOY_TAIL.sub("", cmd)
     if re.search(r"[;|`$<>]", cmd) or cmd.count("&&") > 1:
         return False
     m = DEPLOY_CMD.match(cmd)
@@ -216,6 +220,11 @@ def main() -> None:
         cmd = inp.get("command", "")
         if deploy_allowed(cmd, cwd):
             return
+        if re.search(r"\brailway\s+up\b", cmd) and any(
+                re.search(r"--service\s+" + re.escape(s) + r"\b", cmd) for s in allowed_services()):
+            deny("выкат этого сервиса разрешён, но только одной командой "
+                 "`railway up <дерево> --path-as-root --service <сервис> --detach` "
+                 "(можно `2>&1 | tail -N`), из дерева ровно на свежем origin/main без правок")
         for pattern, reason in BASH_DENY:
             if re.search(pattern, cmd):
                 deny(reason)
