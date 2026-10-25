@@ -12,7 +12,7 @@ Git в этом случае не знает имени ветки, только
 в заголовок:
 
 ```
-Merge /Users/omoto/Projects/_MEDIAOPERATOR/AZ_RAG_ALL/haq-wt/AS-2186-resolvability-gate
+Merge /home/<user>/projects/wt/TKT-2186-search-gate
 ```
 
 В общей истории остаётся путь на машине оркестратора. Для всех остальных это

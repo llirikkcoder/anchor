@@ -13,7 +13,7 @@ anchor-status — одна таблица вместо трёх источник
 Разойтись могут именно три источника, и порознь каждый говорит правду:
   herdr   — какие панели живы и чем заняты
   git     — что лежит в деревьях: несливённое и незакоммиченное
-  EvaTeam — в каком состоянии тикет
+  трекер  — в каком состоянии тикет (если он подключён, см. ниже)
 
 Скрипт их сводит. Ничего не меняет: только читает.
 
@@ -24,13 +24,29 @@ anchor-status — одна таблица вместо трёх источник
 
 Запуск:  anchor-status            из каталога репозитория
          anchor-status --wt ПУТЬ  если деревья лежат не рядом
+
+ТИКЕТ. Код тикета ищется в имени ветки, а если его там нет — в имени воркера,
+по шаблону ANCHOR_TICKET_RE (по умолчанию — код вида ABC-123, ABC2-45: латинские
+заглавные, дефис, цифры, отдельным словом). Кодов в ветке бывает несколько
+(TKT-1637-SUB-036-…) — берётся первый: имя ветки начинается с кода внешнего
+трекера, а следующие коды — подтемы якоря (их разбирает хук старта).
+Трекер с другими кодами — свой шаблон: ANCHOR_TICKET_RE='#[0-9]+'.
+
+Состояние тикета спрашивается командой ANCHOR_TICKET_STATUS_CMD: {code}
+подставляется кодом, первая строка вывода — состояние. Например:
+  ANCHOR_TICKET_STATUS_CMD='jira issue view {code} --plain --columns status'
+Без неё — каталог get-tickets в репозитории (EvaTeam), если он есть;
+нет ни того, ни другого — колонка показывает только код.
 """
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
+
+DEFAULT_TICKET_RE = r"(?<![A-Za-z0-9])[A-Z][A-Z0-9]*-\d+(?![A-Za-z0-9])"
 
 
 def run(cmd, cwd=None, timeout=20):
@@ -82,9 +98,26 @@ def tree_state(path):
     }
 
 
+def ticket_code(branch, worker):
+    """Код тикета: первый в имени ветки, иначе в имени воркера; пусто, если нет."""
+    pattern = re.compile(os.environ.get("ANCHOR_TICKET_RE") or DEFAULT_TICKET_RE)
+    for text in (branch, worker.upper()):
+        found = pattern.findall(text or "")
+        if found:
+            first = found[0]
+            return first if isinstance(first, str) else first[0]
+    return ""
+
+
 def ticket_status(code, gt_dir):
-    """Состояние тикета в EvaTeam. Пусто, если скилл недоступен."""
-    if not code or not gt_dir.exists():
+    """Состояние тикета в трекере. Пусто, если трекер не подключён или не ответил."""
+    if not code:
+        return ""
+    cmd = os.environ.get("ANCHOR_TICKET_STATUS_CMD")
+    if cmd:
+        out = run([part.replace("{code}", code) for part in shlex.split(cmd)], timeout=25)
+        return out.splitlines()[0].strip() if out else ""
+    if not gt_dir.exists():
         return ""
     code_py = (
         "import os,sys;"
@@ -118,8 +151,7 @@ def main():
             continue
         seen_paths.add(cwd)
         st = tree_state(cwd)
-        m = re.search(r"AS-\d+", st["branch"]) or re.search(r"AS-\d+", name.upper())
-        code = m.group(0) if m else ""
+        code = ticket_code(st["branch"], name)
         rows.append({
             "worker": name,
             "branch": st["branch"],
@@ -146,7 +178,7 @@ def main():
         return
 
     # Статусы тикетов спрашиваем только там, где есть что забирать: запрос
-    # к EvaTeam не быстрый, а для пустых деревьев ответ ничего не меняет.
+    # к трекеру не быстрый, а для пустых деревьев ответ ничего не меняет.
     for r in rows:
         if r["unmerged"] or r["dirty"]:
             r["ticket_status"] = ticket_status(r["ticket"], gt_dir)

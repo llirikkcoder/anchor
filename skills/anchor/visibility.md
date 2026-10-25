@@ -28,12 +28,12 @@
 
 **Воркер пишет оркестратору тоже через `herdr agent prompt`, а не через
 `SendMessage`.** Оркестратор, поднятый в панели herdr, для `SendMessage`
-невидим: имя `haq-orchestrator` есть только в herdr, а `ListAgents` показывает
-сессии под своими именами (`haq-ai-concept-ab` и т. п.), по которым не понять,
+невидим: имя `proj-orchestrator` есть только в herdr, а `ListAgents` показывает
+сессии под своими именами (`proj-repo-ab` и т. п.), по которым не понять,
 кто из них оркестратор. 14.10.2026 воркер bm-migrate отправил отчёт по фазе
-через `SendMessage({to: "haq-orchestrator"})` и получил «No agent named
-'haq-orchestrator' is reachable». Дошло только через
-`herdr agent prompt haq-orchestrator "<текст>"`: ответ херд вернул как
+через `SendMessage({to: "proj-orchestrator"})` и получил «No agent named
+'proj-orchestrator' is reachable». Дошло только через
+`herdr agent prompt proj-orchestrator "<текст>"`: ответ херд вернул как
 `agent_prompted`. Порядок такой:
 
 ```bash
@@ -59,19 +59,22 @@ herdr agent prompt <оркестратор> "<итог: что сделано, �
 
 - **herdr** — какие панели живы и чем заняты;
 - **git** — что лежит в деревьях: несливённое и незакоммиченное;
-- **EvaTeam** — в каком состоянии тикет.
+- **трекер** — в каком состоянии тикет. Код тикета берётся из имени ветки по
+  шаблону `ANCHOR_TICKET_RE` (по умолчанию `ABC-123`), состояние — командой
+  `ANCHOR_TICKET_STATUS_CMD` с `{code}`; без неё — каталог `get-tickets`
+  (EvaTeam), если он есть, иначе в колонке только код.
 
 Расходятся они молча. `scripts/anchor-status` сводит их в одну таблицу:
 
 ```
 воркер      ветка                не слито  не закоммич  состояние  тикет
-as-2209     AS-2209-expert-gt           0            1  idle       AS-2209 IN_PROGRESS ←
-oq-gate     AS-2022-oq-gate             1            0  idle       AS-2022 IN_PROGRESS ←
+tkt-2209    TKT-2209-review-queue       0            1  idle       TKT-2209 IN_PROGRESS ←
+merge-gate  TKT-2022-merge-gate         1            0  idle       TKT-2022 IN_PROGRESS ←
 
 ДЕРЕВЬЯ БЕЗ ВОРКЕРА — работа есть, сказать о ней некому:
-  AS-2182-parent-window          не слито 0, не закоммичено 3
+  TKT-2182-parent-window         не слито 0, не закоммичено 3
 
-ЗАБРАТЬ: oq-gate
+ЗАБРАТЬ: merge-gate
 ```
 
 Стрелка отмечает то, что ждёт оркестратора. Отдельный раздел — деревья,
@@ -88,8 +91,8 @@ oq-gate     AS-2022-oq-gate             1            0  idle       AS-2022 IN_PR
 ### Читать результат
 
 ```bash
-herdr agent get as2119
-herdr agent read as2119 --source recent-unwrapped --lines 200
+herdr agent get tkt2119
+herdr agent read tkt2119 --source recent-unwrapped --lines 200
 ```
 
 ### Когда пошло не так
