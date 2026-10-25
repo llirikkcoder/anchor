@@ -22,9 +22,9 @@ SKILL.md**: дерево через `git worktree add`, пространство
 пространством в конец списка, без линии к оркестратору (14.10.2026):
 
 ```bash
-git -C <репозиторий> worktree add -b AS-2119-кратко /абс/путь/wt/AS-2119-кратко origin/main
-herdr worktree open --workspace "$HERDR_WORKSPACE_ID" --path /абс/путь/wt/AS-2119-кратко \
-  --label "AS-2119 кратко" --no-focus --trust-repository
+git -C <репозиторий> worktree add -b TKT-2119-кратко /абс/путь/wt/TKT-2119-кратко origin/main
+herdr worktree open --workspace "$HERDR_WORKSPACE_ID" --path /абс/путь/wt/TKT-2119-кратко \
+  --label "TKT-2119 кратко" --no-focus --trust-repository
 ```
 
 *Тема — вкладка внутри рабочего воркспейса (если так привычнее).* Здесь
@@ -34,9 +34,9 @@ herdr worktree open --workspace "$HERDR_WORKSPACE_ID" --path /абс/путь/wt
 git, а вкладку — отдельной командой:
 
 ```bash
-git -C <репозиторий> worktree add -b AS-2119-кратко ../wt/AS-2119-кратко main
-herdr tab create --workspace <id> --cwd ../wt/AS-2119-кратко \
-  --label "AS-2119 кратко" --no-focus
+git -C <репозиторий> worktree add -b TKT-2119-кратко ../wt/TKT-2119-кратко main
+herdr tab create --workspace <id> --cwd ../wt/TKT-2119-кратко \
+  --label "TKT-2119 кратко" --no-focus
 ```
 
 В обоих случаях ответ — JSON: `workspace_id`, `root_pane.pane_id`, `tab_id`.
@@ -53,8 +53,8 @@ herdr tab create --workspace <id> --cwd ../wt/AS-2119-кратко \
 отдать работу, ни прочитать результат. Второй шаг обязателен:
 
 ```bash
-herdr agent start as2119 --kind claude --pane wB:p1
-herdr tab rename wB:t1 "AS-2119 кратко"
+herdr agent start tkt2119 --kind claude --pane wB:p1
+herdr tab rename wB:t1 "TKT-2119 кратко"
 ```
 
 Имя агента осмысленное и уникальное — оно же адрес для `agent prompt` и
@@ -68,7 +68,7 @@ herdr tab rename wB:t1 "AS-2119 кратко"
 ```bash
 herdr agent list
 herdr pane list --workspace wB
-herdr agent start as2119 --kind claude --pane wB:p1
+herdr agent start tkt2119 --kind claude --pane wB:p1
 ```
 
 Лишний `pane split` в этом случае заводит второй воркер на ту же тему, и два
@@ -80,7 +80,7 @@ herdr agent start as2119 --kind claude --pane wB:p1
 ```bash
 split=$(herdr pane split --current --direction right --cwd "$WORKTREE" --no-focus)
 pane=$(printf '%s' "$split" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
-herdr agent start as2119 --kind claude --pane "$pane"
+herdr agent start tkt2119 --kind claude --pane "$pane"
 ```
 
 Широкую панель делят вправо, узкую вниз (`herdr pane layout --pane
@@ -254,7 +254,7 @@ bypassPermissions` на `--dangerously-skip-permissions` — ограда и е�
 продолжила спрашивать.
 
 ```bash
-herdr agent start as2119 --kind claude --pane "$pane" -- --dangerously-skip-permissions --model sonnet
+herdr agent start tkt2119 --kind claude --pane "$pane" -- --dangerously-skip-permissions --model sonnet
 ```
 
 Ограда — в тот же `settings.local.json` дерева, до старта, **абсолютным
@@ -283,7 +283,7 @@ Claude Code показывает на каждый новый каталог, и
 
 ```bash
 herdr pane send-keys "$pane" Down Enter      # «Yes, I trust this folder»
-herdr agent rename "$pane" as2119            # если start ответил agent_not_ready
+herdr agent rename "$pane" tkt2119            # если start ответил agent_not_ready
 ```
 
 Чужие и незнакомые каталоги так не открывают — там отвечает человек.
@@ -291,7 +291,7 @@ herdr agent rename "$pane" as2119            # если start ответил age
 ### Раздать и дождаться
 
 ```bash
-herdr agent prompt as2119 "<постановка>" --wait --timeout 600000
+herdr agent prompt tkt2119 "<постановка>" --wait --timeout 600000
 ```
 
 **`--wait` достаточно.** Он ждёт первое устоявшееся состояние из трёх —
@@ -303,7 +303,7 @@ herdr agent prompt as2119 "<постановка>" --wait --timeout 600000
 например, дождаться, когда уже запущенный агент упрётся в вопрос:
 
 ```bash
-herdr agent wait as2119 --until blocked --timeout 120000
+herdr agent wait tkt2119 --until blocked --timeout 120000
 ```
 
 Отдав работу нескольким воркерам, статусы опрашивают одним `herdr agent list`,
@@ -323,8 +323,8 @@ herdr agent wait as2119 --until blocked --timeout 120000
 ```bash
 # по одному фоновому ожиданию на воркера, сразу после agent prompt:
 # сначала — что он взялся за работу, потом — что закончил
-herdr agent wait as2119 --until working --timeout 120000
-herdr agent wait as2119 --timeout 7200000   # вернётся на idle / done / blocked
+herdr agent wait tkt2119 --until working --timeout 120000
+herdr agent wait tkt2119 --timeout 7200000   # вернётся на idle / done / blocked
 ```
 
 Первая строка не лишняя. Сразу после `agent prompt` воркер ещё `idle` —
