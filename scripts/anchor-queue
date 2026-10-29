@@ -282,6 +282,13 @@ def write_role(t: dict, tree: str, orch: str) -> None:
             f"`{HERE}/worker-done --not-done \"<вопрос>\"` и стоп.\n"
             f"  Решения за людей не принимай; слияние, миграции и прод — не твои.\n"
             f"- Постановка темы — первое сообщение сессии и `bd show {t['anchor']}`.\n")
+        board = os.path.join(sh("git", "-C", tree, "rev-parse", "--path-format=absolute",
+                                "--git-common-dir").strip(), "anchor", "questions-board")
+        if os.path.exists(board):
+            f.write(
+                f"- Каждый блокер — ещё и запись в таблицу вопросов {open(board).read().strip()}\n"
+                f"  (ArtifactData, коллекция questions; поля и запреты — workers.md,\n"
+                f"  «Блокер — в общую таблицу вопросов»). Ответ читай оттуда же.\n")
     ex = os.path.join(sh("git", "-C", tree, "rev-parse", "--path-format=absolute", "--git-common-dir").strip(),
                       "info", "exclude")
     have = open(ex).read().split("\n") if os.path.exists(ex) else []
