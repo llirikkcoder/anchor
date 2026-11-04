@@ -89,6 +89,7 @@ def write_state(state: str, reason: str) -> None:
         "at": now().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "branch": git(tree, "rev-parse", "--abbrev-ref", "HEAD"),
         "agent_pane": os.environ.get("HERDR_PANE_ID", ""),
+        "orchestrator": os.environ.get("ANCHOR_PARENT", ""),
     }
     path = os.path.join(tree, ".anchor", "state.json")
     with open(path + ".tmp", "w") as f:

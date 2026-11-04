@@ -24,6 +24,14 @@ anchor-status — одна таблица вместо трёх источник
 
 Запуск:  anchor-status            из каталога репозитория
          anchor-status --wt ПУТЬ  если деревья лежат не рядом
+         anchor-status --all      раздел УБРАТЬ — по всем родителям, не только своим
+
+УБРАТЬ. Дерево, в котором воркер сдал работу (.anchor/done.json, «сделано»), а
+ветка уже в origin/main и ничего не лежит незакоммиченным, — забытая уборка:
+дерево и панель стоят, хотя тема закрыта. Показываются только деревья, чей
+родитель (поле orchestrator маркера, из ANCHOR_PARENT) — ты: оркестратор или
+воркер, который сам завёл воркеров. «Ты» — ANCHOR_ORCHESTRATOR или имя своей
+панели в herdr. Маркер без родителя (старый) показывается всем с «?».
 
 ТИКЕТ. Код тикета ищется в имени ветки, а если его там нет — в имени воркера,
 по шаблону ANCHOR_TICKET_RE (по умолчанию — код вида ABC-123, ABC2-45: латинские
@@ -73,7 +81,8 @@ def herdr_agents():
         name = a.get("name")
         if name:
             res[name] = {"cwd": a.get("cwd", ""),
-                         "status": a.get("agent_status", "?")}
+                         "status": a.get("agent_status", "?"),
+                         "pane": a.get("pane_id", "")}
     return res
 
 
@@ -89,13 +98,43 @@ def tree_state(path):
     dirty = run(["git", "status", "--porcelain"], cwd=path)
     # Файлы роли и выгрузки эксперта за работу не считаем: они живут в дереве
     # по замыслу и мусором не являются.
-    skip = re.compile(r"CLAUDE\.local\.md|\.xlsx$|\.json$")
+    skip = re.compile(r"CLAUDE\.local\.md|\.xlsx$|\.json$|\.anchor/")
     dirty_n = len([l for l in dirty.splitlines() if l and not skip.search(l)])
     return {
         "branch": branch or "—",
         "unmerged": len(unmerged.splitlines()) if unmerged else 0,
         "dirty": dirty_n,
     }
+
+
+def done_marker(path):
+    """Маркер worker-done в дереве; пустой словарь, если его нет или он битый."""
+    try:
+        d = json.loads((Path(path) / ".anchor" / "done.json").read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def tree_parent(path, marker):
+    """Родитель дерева: из маркера, иначе из ANCHOR_PARENT в настройках дерева."""
+    if marker.get("orchestrator"):
+        return marker["orchestrator"]
+    try:
+        cfg = json.loads((Path(path) / ".claude" / "settings.local.json").read_text())
+        return (cfg.get("env") or {}).get("ANCHOR_PARENT", "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def my_name(agents):
+    """Имя, под которым меня записывают родителем: ANCHOR_ORCHESTRATOR или своя панель."""
+    name = os.environ.get("ANCHOR_ORCHESTRATOR", "")
+    pane = os.environ.get("HERDR_PANE_ID", "")
+    for n, info in agents.items():
+        if not name and pane and info.get("pane") == pane:
+            name = n
+    return name
 
 
 def ticket_code(branch, worker):
@@ -163,17 +202,48 @@ def main():
 
     # Деревья без воркера: работа в них есть, а сказать о ней некому.
     orphans = []
+    trees = {Path(cwd): name for name, info in agents.items()
+             for cwd in [info["cwd"]] if cwd in seen_paths}
     if wt_root.exists():
         for d in sorted(wt_root.iterdir()):
             if not d.is_dir() or str(d) in seen_paths:
                 continue
             if not (d / ".git").exists():
                 continue
+            trees[d] = ""
             st = tree_state(d)
             if st["unmerged"] or st["dirty"]:
                 orphans.append({"path": d.name, **st})
 
-    if not rows and not orphans:
+    # Сдано и слито, а дерево стоит: уборка, которую забыли.
+    # «Мои» — и воркеры моих воркеров: родитель, сам заведший воркеров, тоже
+    # подчиняется мне, и его забытая уборка — моя забота.
+    me = my_name(agents)
+    everyone = "--all" in sys.argv or not me
+    markers = {p: done_marker(p) for p in trees}
+    parent_of = {w: tree_parent(p, markers[p]) for p, w in trees.items() if w}
+    mine = {me}
+    while True:
+        more = {w for w, par in parent_of.items() if par in mine} - mine
+        if not more:
+            break
+        mine |= more
+    cleanup = []
+    for path, worker in sorted(trees.items()):
+        m = markers[path]
+        if m.get("status") != "done":
+            continue
+        parent = tree_parent(path, m)
+        if not everyone and parent and parent not in mine:
+            continue
+        st = tree_state(path)
+        if st["unmerged"] or st["dirty"]:
+            continue
+        cleanup.append({"path": path.name, "worker": worker or "—",
+                        "anchor": m.get("anchor", "?"), "at": m.get("at", "?"),
+                        "parent": parent or "?"})
+
+    if not rows and not orphans and not cleanup:
         print("Воркеров нет, деревьев с работой нет.")
         return
 
@@ -201,6 +271,14 @@ def main():
         for o in orphans:
             print(f"  {o['path']:<30} не слито {o['unmerged']}, "
                   f"не закоммичено {o['dirty']}")
+
+    if cleanup:
+        print()
+        who = "все родители" if everyone else f"родитель {me}"
+        print(f"УБРАТЬ — сдано и слито, дерево стоит ({who}):")
+        for c in cleanup:
+            print(f"  {c['path']:<30} якорь {c['anchor']}, сдано {c['at']}, "
+                  f"родитель {c['parent']}, панель {c['worker']}")
 
     pending = [r for r in rows if r["unmerged"]]
     if pending:
