@@ -216,6 +216,10 @@ def write_settings(t: dict, tree: str) -> None:
         # sql-server от убранных деревьев). С верным BEADS_DIR он ходит в сервер
         # основного дерева; с неверным — пусть падает громко, а не плодит процессы.
         cfg["env"]["BEADS_DOLT_AUTO_START"] = "0"
+    # Родитель — машинно, а не только текстом роли: по нему anchor-status --mine
+    # находит сданные деревья. Своя переменная, не ANCHOR_ORCHESTRATOR: у воркера,
+    # который сам заводит воркеров, та значит «моё имя как оркестратора».
+    cfg.setdefault("env", {})["ANCHOR_PARENT"] = t["orchestrator"]
     plugins = cfg.setdefault("enabledPlugins", {})
     for name in t.get("disable_plugins", PLUGINS_OFF):
         plugins[name] = False
