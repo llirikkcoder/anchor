@@ -205,6 +205,8 @@ json.dump({
     "anchor": e["ANCHOR"], "status": e["STATUS"], "summary": e["SUMMARY"],
     "branches": lines("BRANCHES"), "prs": lines("PRS"), "at": e["AT"],
     "agent_pane": e.get("HERDR_PANE_ID", ""),
+    # Кому сдаётся работа: оркестратор или воркер-родитель (anchor-status --mine).
+    "orchestrator": e.get("ANCHOR_PARENT", ""),
 }, open(sys.argv[1], "w"), ensure_ascii=False, indent=2)
 PY
 done
