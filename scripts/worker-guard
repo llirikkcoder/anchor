@@ -64,7 +64,9 @@ BASH_DENY = [
     (r"(^|[;&|]\s*)sudo\b", "sudo"),
     (r"\b(apt|apt-get|dnf|yum|snap)\s+(install|remove|purge)\b", "системные пакеты"),
     (r"\bherdr\s+(workspace|pane|tab|worktree)\s+(close|remove|delete|move)\b", "раскладку herdr меняет оркестратор"),
-    (r"\bherdr\s+agent\s+(prompt|start|stop)\b", "другими агентами управляет оркестратор"),
+    # 20.11.2026, Кирилл: воркер пишет оркестратору сам (herdr agent prompt) — иначе
+    # человек работает курьером. Запускать и останавливать агентов по-прежнему нельзя.
+    (r"\bherdr\s+agent\s+(start|stop)\b", "другими агентами управляет оркестратор"),
     (r"\bbd\s+delete\b", "удалять задачи beads — оркестратор"),
     (r"\bgit\s+worktree\s+(remove|prune)\b", "деревья убирает оркестратор"),
     (r"\bgit\s+branch\s+-[dD]\b", "удаление веток — оркестратор"),
