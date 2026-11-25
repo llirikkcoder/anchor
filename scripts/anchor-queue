@@ -39,6 +39,11 @@ ANCHOR_GUARD      ограда воркера (по умолчанию ~/.local/
   beads_dir              по умолчанию <repo первого дерева>/.beads, если есть
   links    {"node_modules": "/путь"} — ссылки в рабочее дерево
   disable_plugins        какие плагины выключить (по умолчанию браузер и Telegram)
+  kind     claude | codex — какой агент работает (по умолчанию claude). Codex:
+           роль в AGENTS.override.md, запуск ключами из ~/.anchor/codex/<имя>.sh
+           (MCP выключены, окружение, ограда хуком);
+           модель — codex_model или ANCHOR_CODEX_MODEL, глубина —
+           codex_effort или ANCHOR_CODEX_EFFORT (пусто — из ~/.codex/config.toml)
   orchestrator           имя оркестратора в herdr (по умолчанию ANCHOR_ORCHESTRATOR,
                          иначе имя агента в панели, откуда позвали очередь; агента
                          без имени очередь не запустит — см. SKILL, «Воркер знает,
@@ -49,10 +54,12 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import time
+import tomllib
 
 HOME = os.path.expanduser("~")
 QDIR = os.environ.get("ANCHOR_QUEUE_DIR", os.path.join(HOME, ".anchor", "queue"))
@@ -117,6 +124,9 @@ def load_topic(path: str) -> dict:
         raise Fail("нужна постановка: prompt или prompt_file")
     if t.get("prompt_file") and not os.path.isfile(t["prompt_file"]):
         raise Fail(f"prompt_file: нет {t['prompt_file']}")
+    t.setdefault("kind", "claude")
+    if t["kind"] not in ("claude", "codex"):
+        raise Fail(f"kind: {t['kind']} — бывает claude или codex")
     t.setdefault("name", PREFIX + t["anchor"].replace(".", "-"))
     t.setdefault("label", t["anchor"])
     return t
@@ -198,6 +208,24 @@ def make_tree(tr: dict, label: str, primary: bool):
     return panes[0]["pane_id"]
 
 
+def worker_env(t: dict) -> dict:
+    """Окружение воркера — одно для Claude (settings.local.json) и Codex (-c)."""
+    env = {}
+    repo = t["trees"][0]["repo"]
+    beads = t.get("beads_dir") or (os.path.join(repo, ".beads") if os.path.isdir(os.path.join(repo, ".beads")) else "")
+    if beads:
+        env["BEADS_DIR"] = os.path.abspath(beads)
+        # bd в дереве не поднимает свой Dolt-сервер (18.10.2026: 79 осиротевших
+        # sql-server от убранных деревьев). С верным BEADS_DIR он ходит в сервер
+        # основного дерева; с неверным — пусть падает громко, а не плодит процессы.
+        env["BEADS_DOLT_AUTO_START"] = "0"
+    # Родитель — машинно, а не только текстом роли: по нему anchor-status --mine
+    # находит сданные деревья. Своя переменная, не ANCHOR_ORCHESTRATOR: у воркера,
+    # который сам заводит воркеров, та значит «моё имя как оркестратора».
+    env["ANCHOR_PARENT"] = t["orchestrator"]
+    return env
+
+
 def write_settings(t: dict, tree: str) -> None:
     """Локальные настройки дерева — ДО старта: читаются при запуске сессии."""
     d = os.path.join(tree, ".claude")
@@ -208,18 +236,7 @@ def write_settings(t: dict, tree: str) -> None:
         assert isinstance(cfg, dict)
     except Exception:
         cfg = {}
-    repo = t["trees"][0]["repo"]
-    beads = t.get("beads_dir") or (os.path.join(repo, ".beads") if os.path.isdir(os.path.join(repo, ".beads")) else "")
-    if beads:
-        cfg.setdefault("env", {})["BEADS_DIR"] = os.path.abspath(beads)
-        # bd в дереве не поднимает свой Dolt-сервер (18.10.2026: 79 осиротевших
-        # sql-server от убранных деревьев). С верным BEADS_DIR он ходит в сервер
-        # основного дерева; с неверным — пусть падает громко, а не плодит процессы.
-        cfg["env"]["BEADS_DOLT_AUTO_START"] = "0"
-    # Родитель — машинно, а не только текстом роли: по нему anchor-status --mine
-    # находит сданные деревья. Своя переменная, не ANCHOR_ORCHESTRATOR: у воркера,
-    # который сам заводит воркеров, та значит «моё имя как оркестратора».
-    cfg.setdefault("env", {})["ANCHOR_PARENT"] = t["orchestrator"]
+    cfg.setdefault("env", {}).update(worker_env(t))
     plugins = cfg.setdefault("enabledPlugins", {})
     for name in t.get("disable_plugins", PLUGINS_OFF):
         plugins[name] = False
@@ -273,8 +290,14 @@ def write_role(t: dict, tree: str, orch: str) -> None:
     Роль воркера — в CLAUDE.local.md дерева. Claude читает этот файл в каждой
     сессии и после сжатия контекста; постановка в первом сообщении сжатия не
     переживает. Файл — мимо коммита, строкой в info/exclude.
+
+    Codex CLAUDE.local.md не читает — ему та же роль в AGENTS.override.md. Этот
+    файл ЗАМЕНЯЕТ AGENTS.md каталога, а не дополняет (проверено на codex-cli
+    0.171, 26.11.2026: правило из AGENTS.md пропало), поэтому за ролью идёт
+    полный текст AGENTS.md дерева — снимок на момент запуска.
     """
-    with open(os.path.join(tree, "CLAUDE.local.md"), "w") as f:
+    role = os.path.join(tree, "CLAUDE.local.md")
+    with open(role, "w") as f:
         f.write(
             f"# Ты воркер темы {t['anchor']}. Оркестратор — агент herdr «{orch}».\n\n"
             f"- Задачи даёт оркестратор (сообщение начинается с «От оркестратора {orch}») или\n"
@@ -293,13 +316,137 @@ def write_role(t: dict, tree: str, orch: str) -> None:
                 f"- Каждый блокер — ещё и запись в таблицу вопросов {open(board).read().strip()}\n"
                 f"  (ArtifactData, коллекция questions; поля и запреты — workers.md,\n"
                 f"  «Блокер — в общую таблицу вопросов»). Ответ читай оттуда же.\n")
+    files = ["CLAUDE.local.md"]
+    if t["kind"] == "codex":
+        agents = os.path.join(tree, "AGENTS.md")
+        with open(os.path.join(tree, "AGENTS.override.md"), "w") as f:
+            f.write(open(role).read())
+            if os.path.isfile(agents):
+                f.write("\n---\n\n" + open(agents).read())
+        files.append("AGENTS.override.md")
     ex = os.path.join(sh("git", "-C", tree, "rev-parse", "--path-format=absolute", "--git-common-dir").strip(),
                       "info", "exclude")
     have = open(ex).read().split("\n") if os.path.exists(ex) else []
-    if "CLAUDE.local.md" not in have:
-        os.makedirs(os.path.dirname(ex), exist_ok=True)
-        with open(ex, "a") as f:
-            f.write("CLAUDE.local.md\n")
+    for name in files:
+        if name not in have:
+            os.makedirs(os.path.dirname(ex), exist_ok=True)
+            with open(ex, "a") as f:
+                f.write(name + "\n")
+
+
+def toml_str(v: str) -> str:
+    # Строка TOML в двойных кавычках принимает те же экранирования, что JSON.
+    return json.dumps(v, ensure_ascii=False)
+
+
+def claude_args() -> list:
+    # Воркеры — на Sonnet (решение человека 15.10.2026): работа воркера узкая и
+    # описана задачей, а думает за всю тему оркестратор. Другую модель на один
+    # запуск — ANCHOR_WORKER_MODEL (например opus); пусто — модель по умолчанию.
+    model = os.environ.get("ANCHOR_WORKER_MODEL", "sonnet").strip()
+    # Советник (advisor tool, 16.10.2026): воркер на Sonnet сам зовёт Opus в
+    # узловых точках — перед подходом, при застревании, перед «готово». Opus
+    # думает за всю тему, но платим за него только в эти моменты. Пара проверена
+    # запуском `claude -p --model sonnet --advisor opus`. Выключить —
+    # ANCHOR_WORKER_ADVISOR= (пусто), другая модель — ANCHOR_WORKER_ADVISOR=<имя>.
+    advisor = os.environ.get("ANCHOR_WORKER_ADVISOR", "opus").strip()
+    return ["--dangerously-skip-permissions",
+            *(["--model", model] if model else []), *(["--advisor", advisor] if advisor else [])]
+
+
+def codex_args(t: dict, tree: str) -> list:
+    """
+    Ключи запуска Codex-воркера. То, что Claude-воркеру даёт settings.local.json,
+    здесь — ключами -c на одну сессию: общий ~/.codex/config.toml — всех сессий
+    Codex человека, его не трогаем.
+
+    НЕ ПРОФИЛЕМ (`codex -p`, 26.11.2026). Профиль Codex проверяет как отдельный
+    конфиг: запись сервера с одним `enabled = false`, без command/url, —
+    ошибка, а копировать описания нельзя — в них ключи.
+
+    MCP С КЛЮЧАМИ ВЫКЛЮЧЕНЫ: в ~/.codex/config.toml стоят supabase с полным токеном,
+    railway и агентский ключ AI Office, плагины Codex добавляют свои. Воркер
+    без песочницы получил бы прод напрямую, мимо ограды, которая видит только
+    Bash и правки. Claude-воркеру то же делает enabledMcpjsonServers=[].
+
+    Серверы плагинов Codex (cua_repl — управление компьютером, codex_app)
+    ключом -c не выключить: записи без транспорта Codex считает ошибкой и не
+    встаёт. Их убирает `--disable plugins --disable apps`. Серверы общего
+    ~/.codex/config.toml — там ключи прода — выключаем по одному. Серверы из
+    проектного .codex/config.toml репозитория остаются: -c пишет в слой
+    пользователя, и сервер, описанный только в проекте, получает там пустую
+    запись — Codex не встаёт (26.11.2026, playwright-test). Они — часть
+    репозитория, как его тесты.
+    Ключ -c режет путь по точкам и кавычек TOML не понимает
+    (`mcp_servers."x"` — новая запись с кавычками в имени), поэтому имя
+    другого вида — отказ запуска, а не тихо невыключенный сервер.
+    """
+    off = ["--disable", "plugins", "--disable", "apps"]
+    home = os.environ.get("CODEX_HOME", os.path.join(HOME, ".codex"))
+    try:
+        servers = list(tomllib.load(open(os.path.join(home, "config.toml"), "rb")).get("mcp_servers", {}))
+    except FileNotFoundError:
+        servers = []
+    bad = [n for n in servers if not re.fullmatch(r"[A-Za-z0-9_-]+", n)]
+    if bad:
+        raise Fail(f"MCP с именем, которое ключом -c не выключить: {bad}")
+    args = ["--dangerously-bypass-approvals-and-sandbox",
+            # Ограда приходит ключом -c, а не из доверенного hooks.json: без
+            # этого Codex её не запустит, пока человек не одобрит хук в окне.
+            "--dangerously-bypass-hook-trust", *off,
+            # Свой сервер, не общий фоновый: общий один на все клиенты Codex
+            # человека, и с выключенными плагинами Codex предлагает
+            # перезапустить его — с plugins=false для всех (26.11.2026).
+            "--no-daemon",
+            # Диалог «Update now» на старте держал бы панель до человека.
+            "-c", "check_for_update_on_startup=false"]
+    for n in servers:
+        args += ["-c", f"mcp_servers.{n}.enabled=false"]
+    # Окружение — через политику Codex: по умолчанию (inherit=core) команды
+    # получают только базовые переменные, экспорт в оболочке до них не дойдёт.
+    for k, v in worker_env(t).items():
+        args += ["-c", f"shell_environment_policy.set.{k}={toml_str(v)}"]
+    # Хуки PreToolUse срабатывают и без песочницы, код 2 останавливает вызов;
+    # вход Bash — тот же {tool_name, tool_input.command, cwd}, правки —
+    # apply_patch (их разбирает worker-guard). Проверено на codex-cli 0.171.
+    hooks = [f"{{matcher=\".*\",hooks=[{{type=\"command\",command={toml_str(GUARD)}}}]}}"]
+    pitfalls = os.path.join(HERE, "bash-pitfalls")
+    if os.access(pitfalls, os.X_OK):
+        hooks.append(f"{{matcher=\"Bash\",hooks=[{{type=\"command\",command={toml_str(pitfalls)}}}]}}")
+    args += ["-c", f"hooks.PreToolUse=[{','.join(hooks)}]"]
+    model = t.get("codex_model") or os.environ.get("ANCHOR_CODEX_MODEL", "").strip()
+    effort = t.get("codex_effort") or os.environ.get("ANCHOR_CODEX_EFFORT", "").strip()
+    if model:
+        args += ["-m", model]
+    if effort:
+        args += ["-c", f"model_reasoning_effort={toml_str(effort)}"]
+    return args
+
+
+def start_codex(t: dict, tree: str, pane: str) -> None:
+    """
+    Codex — не через `herdr agent start`: тот печатает команду в панель, а
+    ключей у Codex-воркера два десятка, строка больше предела строки терминала
+    macOS (~1 КБ). 26.11.2026 herdr напечатал её обрезанной, Codex не встал.
+    Поэтому ключи — в запускателе, в панель уходит `sh <запускатель>`, а herdr
+    узнаёт Codex в панели сам; имя ставим rename.
+    """
+    d = os.path.join(HOME, ".anchor", "codex")
+    os.makedirs(d, exist_ok=True)
+    launcher = os.path.join(d, t["name"] + ".sh")
+    with open(launcher, "w") as f:
+        f.write(f"#!/bin/sh\n# Запуск Codex-воркера {t['name']} (тема {t['anchor']}) — пишет anchor-queue.\n"
+                f"exec codex {' '.join(shlex.quote(a) for a in codex_args(t, tree))}\n")
+    sh("herdr", "pane", "run", pane, f"sh {shlex.quote(launcher)}")
+    for _ in range(60):
+        time.sleep(2)
+        for a in herdr_json("agent", "list")["agents"]:
+            if a.get("pane_id") == pane and a.get("agent") == "codex":
+                if a.get("name") != t["name"]:
+                    sh("herdr", "agent", "rename", pane, t["name"])
+                return
+    screen = sh("herdr", "pane", "read", pane, "--source", "recent-unwrapped", "--lines", "15", check=False)
+    raise Fail(f"Codex не встал в {pane} за 120 с: {screen.strip()[-300:]}")
 
 
 def prompt_text(t: dict, tree: str) -> str:
@@ -350,20 +497,12 @@ def start(t: dict) -> str:
             with open(ex, "a") as f:
                 f.write(f"/{name}\n")
 
-    # Воркеры — на Sonnet (решение человека 15.10.2026): работа воркера узкая и
-    # описана задачей, а думает за всю тему оркестратор. Другую модель на один
-    # запуск — ANCHOR_WORKER_MODEL (например opus); пусто — модель по умолчанию.
-    model = os.environ.get("ANCHOR_WORKER_MODEL", "sonnet").strip()
-    # Советник (advisor tool, 16.10.2026): воркер на Sonnet сам зовёт Opus в
-    # узловых точках — перед подходом, при застревании, перед «готово». Opus
-    # думает за всю тему, но платим за него только в эти моменты. Пара проверена
-    # запуском `claude -p --model sonnet --advisor opus`. Выключить —
-    # ANCHOR_WORKER_ADVISOR= (пусто), другая модель — ANCHOR_WORKER_ADVISOR=<имя>.
-    advisor = os.environ.get("ANCHOR_WORKER_ADVISOR", "opus").strip()
-    extra = [*(["--model", model] if model else []), *(["--advisor", advisor] if advisor else [])]
-    r = subprocess.run(["herdr", "agent", "start", t["name"], "--kind", "claude", "--pane", pane,
-                        "--", "--dangerously-skip-permissions", *extra],
-                       capture_output=True, text=True)
+    if t["kind"] == "codex":
+        start_codex(t, tree, pane)
+        r = subprocess.CompletedProcess([], 0)
+    else:
+        r = subprocess.run(["herdr", "agent", "start", t["name"], "--kind", "claude", "--pane", pane,
+                            "--", *claude_args()], capture_output=True, text=True)
     if r.returncode != 0:
         if "agent_not_ready" not in (r.stderr + r.stdout):
             raise Fail(f"agent start: {(r.stderr or r.stdout).strip()[:300]}")
