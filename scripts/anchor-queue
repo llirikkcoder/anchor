@@ -108,7 +108,8 @@ def load_topic(path: str) -> dict:
         t = json.load(open(path))
     except Exception as e:
         raise Fail(f"{path}: не JSON ({e})")
-    if not re.fullmatch(r"[a-z][a-z0-9]*-[a-z0-9]{3,8}(\.[0-9]+)?", t.get("anchor", "")):
+    # Префикс bd бывает с дефисами (haq-ai-concept-t2cx): bd берёт его из имени каталога.
+    if not re.fullmatch(r"[a-z][a-z0-9-]*-[a-z0-9]{3,8}(\.[0-9]+)?", t.get("anchor", "")):
         raise Fail("anchor: нужен id якоря beads")
     if not t.get("trees"):
         raise Fail("trees: нужно хотя бы одно дерево")
@@ -354,7 +355,7 @@ def claude_args() -> list:
             *(["--model", model] if model else []), *(["--advisor", advisor] if advisor else [])]
 
 
-def codex_args(t: dict, tree: str) -> list:
+def codex_args(t: dict, tree: str, pane: str) -> list:
     """
     Ключи запуска Codex-воркера. То, что Claude-воркеру даёт settings.local.json,
     здесь — ключами -c на одну сессию: общий ~/.codex/config.toml — всех сессий
@@ -404,7 +405,16 @@ def codex_args(t: dict, tree: str) -> list:
         args += ["-c", f"mcp_servers.{n}.enabled=false"]
     # Окружение — через политику Codex: по умолчанию (inherit=core) команды
     # получают только базовые переменные, экспорт в оболочке до них не дойдёт.
-    for k, v in worker_env(t).items():
+    env = worker_env(t)
+    # herdr тоже: без HERDR_ENV=1 навык herdr запрещает `herdr agent prompt`, и
+    # воркер не может сообщить оркестратору (26.11.2026, первый Codex-воркер).
+    # Claude-воркер наследует их от панели, Codex их отрезает. Панель — воркера.
+    for k in ("HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_BIN_PATH", "HERDR_SESSION"):
+        if os.environ.get(k):
+            env[k] = os.environ[k]
+    env["HERDR_PANE_ID"] = pane
+    env["HERDR_WORKSPACE_ID"] = pane.split(":")[0]
+    for k, v in env.items():
         args += ["-c", f"shell_environment_policy.set.{k}={toml_str(v)}"]
     # Хуки PreToolUse срабатывают и без песочницы, код 2 останавливает вызов;
     # вход Bash — тот же {tool_name, tool_input.command, cwd}, правки —
@@ -436,7 +446,7 @@ def start_codex(t: dict, tree: str, pane: str) -> None:
     launcher = os.path.join(d, t["name"] + ".sh")
     with open(launcher, "w") as f:
         f.write(f"#!/bin/sh\n# Запуск Codex-воркера {t['name']} (тема {t['anchor']}) — пишет anchor-queue.\n"
-                f"exec codex {' '.join(shlex.quote(a) for a in codex_args(t, tree))}\n")
+                f"exec codex {' '.join(shlex.quote(a) for a in codex_args(t, tree, pane))}\n")
     sh("herdr", "pane", "run", pane, f"sh {shlex.quote(launcher)}")
     for _ in range(60):
         time.sleep(2)
