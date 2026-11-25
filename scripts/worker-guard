@@ -72,7 +72,7 @@ BASH_DENY = [
     (r"\bgit\s+branch\s+-[dD]\b", "удаление веток — оркестратор"),
     # Только запись в эти файлы, а не любое упоминание: 18.10.2026 воркер получил
     # отказ на worker-state, потому что в тексте причины встретилось имя ограды.
-    (r"(>|\btee\b|\bsed\s+-i|\bcp\b|\bmv\b|\brm\b|\bln\b|\bchmod\b)[^|;&]*(worker-guard|settings(\.local)?\.json|\.claude/hooks|\.claude\.json)", "ограду и настройки Claude правит только оркестратор"),
+    (r"(>|\btee\b|\bsed\s+-i|\bcp\b|\bmv\b|\brm\b|\bln\b|\bchmod\b)[^|;&]*(worker-guard|settings(\.local)?\.json|\.claude/hooks|\.claude\.json|\.codex/|AGENTS\.override\.md)", "ограду и настройки агента правит только оркестратор"),
     (r"(>|\btee\b|\bsed\s+-i|\bcp\b|\bmv\b|\brm\b|\bln\b|\bchmod\b)[^|;&]*deploy_allow", "список разрешённого деплоя ведёт только владелец"),
     (r"(^|[;&|]\s*|\s)(pkill|killall)\b", "pkill/killall бьют по шаблону и задевают чужие процессы — останавливай свой процесс по pid"),
     (r"\bcrontab\b|\bsystemctl\s+(start|stop|restart|enable|disable)\b", "службы машины"),
@@ -85,6 +85,9 @@ WRITE_DENY = [
     (r"worker-guard$", "ограду правит только оркестратор"),
     (r"(^|/)\.claude/(settings(\.local)?\.json|hooks/)", "настройки Claude правит только оркестратор"),
     (r"(^|/)\.claude\.json$", "настройки Claude правит только оркестратор"),
+    # Воркер на Codex (aio-r7hp): его настройки и роль — те же файлы по смыслу.
+    (r"(^|/)\.codex/(config\.toml|hooks\.json|hooks/)", "настройки Codex правит только оркестратор"),
+    (r"(^|/)AGENTS\.override\.md$", "роль воркера пишет очередь, не воркер"),
 ]
 
 READ_DENY = [
@@ -232,6 +235,19 @@ def main() -> None:
                 deny(reason)
         if rm_outside_tree(cmd, cwd):
             deny("rm -rf вне своего дерева")
+    elif tool == "apply_patch":
+        # Codex правит файлы не Edit/Write, а патчем: пути — в строках
+        # «*** Add/Update/Delete File: <путь>» и «*** Move to: <путь>» (вход
+        # tool_input.command, проверено на codex-cli 0.171, 26.11.2026). Без
+        # этой ветки воркер на Codex писал бы мимо WRITE_DENY и чужих деревьев.
+        patch = inp.get("command") or inp.get("input") or inp.get("patch") or ""
+        for m in re.finditer(r"^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+?)\s*$", patch, re.M):
+            path = os.path.join(cwd, os.path.expanduser(m.group(1)))
+            for pattern, reason in READ_DENY + WRITE_DENY:
+                if re.search(pattern, path):
+                    deny(reason)
+            if edit_outside_trees(path, cwd):
+                deny("правка вне своих деревьев — чужая работа")
     elif tool in ("Read", "Edit", "Write", "NotebookEdit", "Grep", "Glob"):
         path = inp.get("file_path") or inp.get("notebook_path") or inp.get("path") or ""
         path = os.path.expanduser(path)
