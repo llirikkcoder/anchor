@@ -15,7 +15,7 @@ anchor-status — одна таблица вместо трёх источник
   git     — что лежит в деревьях: несливённое и незакоммиченное
   трекер  — в каком состоянии тикет (если он подключён, см. ниже)
 
-Скрипт их сводит. Ничего не меняет: только читает.
+Скрипт их сводит. Ничего не меняет, кроме явного --mark: только читает.
 
 КОГДА СМОТРЕТЬ
   — перед закрытием темы (шаг 4 из пяти: «дерево убрано»);
@@ -25,6 +25,9 @@ anchor-status — одна таблица вместо трёх источник
 Запуск:  anchor-status            из каталога репозитория
          anchor-status --wt ПУТЬ  если деревья лежат не рядом
          anchor-status --all      раздел УБРАТЬ — по всем родителям, не только своим
+         anchor-status --mark     единственное, что пишет: оставить на якорях слитых PR
+                                  след «PR #N слит …, осталось: …» (merge-trace --sweep).
+                                  Ловит слияние человеком на GitHub; повтор дублей не даёт.
 
 УБРАТЬ. Дерево, в котором воркер сдал работу (.anchor/done.json, «сделано»), а
 ветка уже в origin/main и ничего не лежит незакоммиченным, — забытая уборка:
@@ -242,6 +245,16 @@ def main():
         cleanup.append({"path": path.name, "worker": worker or "—",
                         "anchor": m.get("anchor", "?"), "at": m.get("at", "?"),
                         "parent": parent or "?"})
+
+    if "--mark" in sys.argv:
+        tool = Path(__file__).resolve().parent / "merge-trace"
+        trees_with_marker = [str(p) for p in trees if markers[p]]
+        if trees_with_marker:
+            r = subprocess.run([str(tool), "--sweep", *trees_with_marker],
+                               capture_output=True, text=True)
+            out = (r.stdout + r.stderr).strip()
+            if out:
+                print("СЛЕД СЛИЯНИЯ:\n" + "\n".join("  " + l for l in out.splitlines()) + "\n")
 
     if not rows and not orphans and not cleanup:
         print("Воркеров нет, деревьев с работой нет.")
