@@ -231,6 +231,36 @@ create`, `settings.local.json` до старта (BEADS_DIR, ограда, ли�
 модель по умолчанию. Подагенты, которых оркестратор зовёт сам (Agent), — тоже
 с `model: sonnet`, если задача не требует иного.
 
+#### Воркер на Codex или agy — поле `kind`
+
+Тему можно отдать не Claude: `"kind": "codex"` или `"kind": "agy"` (Antigravity
+CLI) в описании темы. Всё остальное — дерево, постановка, `worker-state`,
+`worker-done`, связь через herdr — то же; очередь сама переводит на язык агента
+роль, окружение и ограду. Запуск — скриптом `~/.anchor/<kind>/<имя>.sh`, а не
+`herdr agent start`: ключей больше, чем влезает в строку терминала.
+
+| | Codex | agy |
+|---|---|---|
+| режим без вопросов | `--dangerously-bypass-approvals-and-sandbox` | `--dangerously-skip-permissions` (yolo) |
+| роль | `AGENTS.override.md` (роль + AGENTS.md) | `GEMINI.md` рядом с AGENTS.md |
+| ограда | хук `-c hooks.PreToolUse` → worker-guard | `.agents/hooks.json` дерева → `scripts/agy-hook` → worker-guard |
+| окружение | `-c shell_environment_policy.set.*` | экспорт в скрипте запуска |
+| модель | `codex_model` / `ANCHOR_CODEX_MODEL` | `agy_model` / `ANCHOR_AGY_MODEL`, глубина `agy_effort` / `ANCHOR_AGY_EFFORT` |
+
+agy запускается **так и только так** (решение владельца 26.11.2026):
+`--settings` на одну сессию несёт доверие к дереву (иначе agy стоит на
+«Do you trust the contents of this project?») и схему цветов
+`colorblind-friendly dark` — общая схема владельца светлая, на тёмных панелях
+herdr текст agy выходит чёрным по чёрному. Другая схема — `ANCHOR_AGY_COLOR_SCHEME`,
+пусто — как у владельца. Общие настройки `~/.gemini` воркеру не правим и
+воркеру править не даём (worker-guard).
+
+Ограничение `worker-done` (у всех видов воркеров): он и с `--not-done` пушит
+ветку и открывает PR, поэтому тема без коммитов (проба, исследование) им не
+сдаётся — «No commits between main and …» (26.11.2026, проба aio-51x8). Такую
+тему воркер сдаёт сообщением оркестратору через herdr, а оркестратор принимает
+по нему.
+
 Активный воркер — агент с именем на `w-` без свежего маркера готовности;
 головы и оркестратор в счёт не идут. Потолок — `ANCHOR_MAX` (по умолчанию 3).
 Демона нет: `run` зовёт оркестратор в фоне, второй `run` при живом первом
