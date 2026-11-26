@@ -506,8 +506,14 @@ def agy_args(t: dict, tree: str) -> list:
     # до человека (26.11.2026, первый запуск). Дерево завела сама очередь —
     # как с диалогом доверия Claude (решение человека 05.10.2026). Общий
     # settings.json человека не трогаем: --settings в него не пишет.
-    trust = {"trustedWorkspaces": [os.path.abspath(tr["path"]) for tr in t["trees"]]}
-    return ["--dangerously-skip-permissions", "--settings", json.dumps(trust, ensure_ascii=False),
+    session = {"trustedWorkspaces": [os.path.abspath(tr["path"]) for tr in t["trees"]]}
+    # Схема цветов — под тёмные панели herdr. Общая настройка человека —
+    # «colorblind-friendly light»: на тёмном фоне основной текст agy выходит
+    # чёрным по чёрному (26.11.2026, первый agy-воркер). Пусто — как у человека.
+    scheme = os.environ.get("ANCHOR_AGY_COLOR_SCHEME", "colorblind-friendly dark").strip()
+    if scheme:
+        session["colorScheme"] = scheme
+    return ["--dangerously-skip-permissions", "--settings", json.dumps(session, ensure_ascii=False),
             *(["--model", model] if model else []), *(["--effort", effort] if effort else [])]
 
 
