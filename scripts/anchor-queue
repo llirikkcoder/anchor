@@ -39,11 +39,14 @@ ANCHOR_GUARD      ограда воркера (по умолчанию ~/.local/
   beads_dir              по умолчанию <repo первого дерева>/.beads, если есть
   links    {"node_modules": "/путь"} — ссылки в рабочее дерево
   disable_plugins        какие плагины выключить (по умолчанию браузер и Telegram)
-  kind     claude | codex — какой агент работает (по умолчанию claude). Codex:
+  kind     claude | codex | agy — какой агент работает (по умолчанию claude). Codex:
            роль в AGENTS.override.md, запуск ключами из ~/.anchor/codex/<имя>.sh
            (MCP выключены, окружение, ограда хуком);
            модель — codex_model или ANCHOR_CODEX_MODEL, глубина —
-           codex_effort или ANCHOR_CODEX_EFFORT (пусто — из ~/.codex/config.toml)
+           codex_effort или ANCHOR_CODEX_EFFORT (пусто — из ~/.codex/config.toml).
+           agy (Antigravity CLI): роль в GEMINI.md, ограда в .agents/hooks.json
+           (scripts/agy-hook), запуск из ~/.anchor/agy/<имя>.sh; модель — agy_model
+           или ANCHOR_AGY_MODEL, глубина — agy_effort или ANCHOR_AGY_EFFORT
   orchestrator           имя оркестратора в herdr (по умолчанию ANCHOR_ORCHESTRATOR,
                          иначе имя агента в панели, откуда позвали очередь; агента
                          без имени очередь не запустит — см. SKILL, «Воркер знает,
@@ -126,8 +129,8 @@ def load_topic(path: str) -> dict:
     if t.get("prompt_file") and not os.path.isfile(t["prompt_file"]):
         raise Fail(f"prompt_file: нет {t['prompt_file']}")
     t.setdefault("kind", "claude")
-    if t["kind"] not in ("claude", "codex"):
-        raise Fail(f"kind: {t['kind']} — бывает claude или codex")
+    if t["kind"] not in ("claude", "codex", "agy"):
+        raise Fail(f"kind: {t['kind']} — бывает claude, codex или agy")
     t.setdefault("name", PREFIX + t["anchor"].replace(".", "-"))
     t.setdefault("label", t["anchor"])
     return t
@@ -325,6 +328,15 @@ def write_role(t: dict, tree: str, orch: str) -> None:
             if os.path.isfile(agents):
                 f.write("\n---\n\n" + open(agents).read())
         files.append("AGENTS.override.md")
+    if t["kind"] == "agy":
+        # agy читает и AGENTS.md, и GEMINI.md каталога, вместе (проверено на
+        # agy 1.5.16, 26.11.2026) — роль ложится рядом, без копии AGENTS.md.
+        # Отслеживаемый GEMINI.md затёрли бы и унесли в коммит — отказ.
+        if subprocess.run(["git", "-C", tree, "ls-files", "--error-unmatch", "GEMINI.md"],
+                          capture_output=True).returncode == 0:
+            raise Fail(f"{tree}/GEMINI.md в git — роль agy-воркеру положить некуда")
+        shutil.copyfile(role, os.path.join(tree, "GEMINI.md"))
+        files.append("GEMINI.md")
     ex = os.path.join(sh("git", "-C", tree, "rev-parse", "--path-format=absolute", "--git-common-dir").strip(),
                       "info", "exclude")
     have = open(ex).read().split("\n") if os.path.exists(ex) else []
@@ -448,15 +460,91 @@ def start_codex(t: dict, tree: str, pane: str) -> None:
         f.write(f"#!/bin/sh\n# Запуск Codex-воркера {t['name']} (тема {t['anchor']}) — пишет anchor-queue.\n"
                 f"exec codex {' '.join(shlex.quote(a) for a in codex_args(t, tree, pane))}\n")
     sh("herdr", "pane", "run", pane, f"sh {shlex.quote(launcher)}")
+    wait_kind(t, pane, "codex")
+
+
+def write_agy_hooks(tree: str) -> None:
+    """
+    Ограда agy-воркера — .agents/hooks.json дерева: agy берёт хуки каталога
+    без вопроса о доверии и вызывает их и под --dangerously-skip-permissions
+    (проверено на agy 1.5.16, 26.11.2026). Общий ~/.gemini/config/hooks.json —
+    всех сессий человека, его не трогаем. Файл мимо коммита; чужие хуки в
+    нём сохраняются, наш — под своим именем.
+    """
+    d = os.path.join(tree, ".agents")
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, "hooks.json")
+    try:
+        cfg = json.load(open(p))
+        assert isinstance(cfg, dict)
+    except Exception:
+        cfg = {}
+    cfg["anchor-guard"] = {"PreToolUse": [{"matcher": "*", "hooks": [
+        {"type": "command", "command": os.path.join(HERE, "agy-hook"), "timeout": 30}]}]}
+    with open(p, "w") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    if subprocess.run(["git", "-C", tree, "ls-files", "--error-unmatch", ".agents/hooks.json"],
+                      capture_output=True).returncode == 0:
+        sh("git", "-C", tree, "update-index", "--skip-worktree", ".agents/hooks.json", check=False)
+    else:
+        ex = os.path.join(sh("git", "-C", tree, "rev-parse", "--path-format=absolute",
+                             "--git-common-dir").strip(), "info", "exclude")
+        if ".agents/hooks.json" not in (open(ex).read().split("\n") if os.path.exists(ex) else []):
+            with open(ex, "a") as f:
+                f.write(".agents/hooks.json\n")
+
+
+def agy_args(t: dict, tree: str) -> list:
+    # MCP agy-воркеру не выключаем ключом: у agy нет ключа «без серверов», а
+    # ~/.gemini/config/mcp_config.json пуст (26.11.2026). Появится там сервер
+    # с ключами прода — выключать здесь, как у Codex.
+    model = t.get("agy_model") or os.environ.get("ANCHOR_AGY_MODEL", "").strip()
+    effort = t.get("agy_effort") or os.environ.get("ANCHOR_AGY_EFFORT", "").strip()
+    # Доверие к дереву — ключом --settings на одну сессию: без него agy на
+    # старте спрашивает «Do you trust the contents of this project?» и стоит
+    # до человека (26.11.2026, первый запуск). Дерево завела сама очередь —
+    # как с диалогом доверия Claude (решение человека 05.10.2026). Общий
+    # settings.json человека не трогаем: --settings в него не пишет.
+    session = {"trustedWorkspaces": [os.path.abspath(tr["path"]) for tr in t["trees"]]}
+    # Схема цветов — под тёмные панели herdr. Общая настройка человека —
+    # «colorblind-friendly light»: на тёмном фоне основной текст agy выходит
+    # чёрным по чёрному (26.11.2026, первый agy-воркер). Пусто — как у человека.
+    scheme = os.environ.get("ANCHOR_AGY_COLOR_SCHEME", "colorblind-friendly dark").strip()
+    if scheme:
+        session["colorScheme"] = scheme
+    return ["--dangerously-skip-permissions", "--settings", json.dumps(session, ensure_ascii=False),
+            *(["--model", model] if model else []), *(["--effort", effort] if effort else [])]
+
+
+def start_agy(t: dict, tree: str, pane: str) -> None:
+    """
+    agy — тем же запускателем, что Codex: окружение воркера экспортом (команды
+    agy наследуют окружение процесса — проверено), herdr узнаёт agy в панели сам.
+    """
+    write_agy_hooks(tree)
+    d = os.path.join(HOME, ".anchor", "agy")
+    os.makedirs(d, exist_ok=True)
+    launcher = os.path.join(d, t["name"] + ".sh")
+    with open(launcher, "w") as f:
+        f.write(f"#!/bin/sh\n# Запуск agy-воркера {t['name']} (тема {t['anchor']}) — пишет anchor-queue.\n")
+        for k, v in worker_env(t).items():
+            f.write(f"export {k}={shlex.quote(v)}\n")
+        f.write(f"exec agy {' '.join(shlex.quote(a) for a in agy_args(t, tree))}\n")
+    sh("herdr", "pane", "run", pane, f"sh {shlex.quote(launcher)}")
+    wait_kind(t, pane, "agy")
+
+
+def wait_kind(t: dict, pane: str, kind: str) -> None:
     for _ in range(60):
         time.sleep(2)
         for a in herdr_json("agent", "list")["agents"]:
-            if a.get("pane_id") == pane and a.get("agent") == "codex":
+            if a.get("pane_id") == pane and a.get("agent") == kind:
                 if a.get("name") != t["name"]:
                     sh("herdr", "agent", "rename", pane, t["name"])
                 return
     screen = sh("herdr", "pane", "read", pane, "--source", "recent-unwrapped", "--lines", "15", check=False)
-    raise Fail(f"Codex не встал в {pane} за 120 с: {screen.strip()[-300:]}")
+    raise Fail(f"{kind} не встал в {pane} за 120 с: {screen.strip()[-300:]}")
 
 
 def prompt_text(t: dict, tree: str) -> str:
@@ -507,8 +595,8 @@ def start(t: dict) -> str:
             with open(ex, "a") as f:
                 f.write(f"/{name}\n")
 
-    if t["kind"] == "codex":
-        start_codex(t, tree, pane)
+    if t["kind"] in ("codex", "agy"):
+        (start_codex if t["kind"] == "codex" else start_agy)(t, tree, pane)
         r = subprocess.CompletedProcess([], 0)
     else:
         r = subprocess.run(["herdr", "agent", "start", t["name"], "--kind", "claude", "--pane", pane,
