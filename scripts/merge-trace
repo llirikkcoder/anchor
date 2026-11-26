@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""
+merge-trace — оставить на якоре след слияния PR: комментарий «PR #N слит <sha>
+<дата>, осталось: <хвост>» и метку pr-merged. Задачу НЕ закрывает.
+
+ЗАЧЕМ. 26.11.2026 у aio-1y57.3, aio-cgb2, aio-7lx0 PR были слиты, а задачи
+висели открытыми без следа слияния: состояние жило в окнах воркеров. Закрывать
+само нельзя — слияние ≠ готово: у aio-cgb2 не было живой проверки /model, у
+aio-7lx0 деплой onreza не подхватил main. Закрывает тот, кто проверил.
+
+  merge-trace <якорь> <PR> [--repo <owner/name>] [--dry-run]
+      <PR> — номер, URL или owner/name#N. Не слит — ничего не пишет (код 0).
+  merge-trace --sweep <дерево>… [--dry-run]
+      по маркерам .anchor/done.json: якорь и PR из каждого. Для обхода
+      оркестратора (anchor-status --mark).
+
+ГДЕ СТАВИТСЯ — ВЫБОР (запись в DECISIONS.md, «След слияния»). Слить PR темы
+может воркер, оркестратор (anchor-merge) или человек кнопкой на GitHub. Ни одна
+точка не видит всех трёх, поэтому след пишет один идемпотентный скрипт, а
+звать его могут все точки, и повтор безвреден:
+  — worker-done: ловит «воркер слил сам» (ветка «уже слит») — самый частый
+    путь с 0.1.4. Но если слили ПОСЛЕ сдачи, worker-done уже отработал;
+  — anchor-merge: ловит слияние оркестратором, но не воркера и не человека;
+  — anchor-status --mark (обход): единственный, кто видит слияние на GitHub
+    руками, но срабатывает, только когда его запустили.
+  Отвергнуто: хук/вебхук GitHub → beads — у плагина нет сервера, а доступ из
+  облака к локальной базе beads не нужен ради одной строки; отвергнуто:
+  писать в одном worker-done — теряет слияние после сдачи.
+
+ДУБЛИ. Каждый комментарий кончается ключом [merge-trace owner/name#N]; перед
+записью комментарии якоря просматриваются, ключ есть — пропуск. Метка
+добавляется, только если её ещё нет.
+
+ХВОСТ — из последнего комментария воркера («СДЕЛАНО:»/«НЕ СДЕЛАНО:», его пишет
+worker-done): от слов «осталось/остаётся/не проверено/ждёт/нужно ещё» до конца
+итога. Не названо — так и пишется: хвост не назван, проверь перед закрытием.
+"""
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+
+LABEL = "pr-merged"
+TAIL_RX = re.compile(
+    r"(?is)\b(остал(?:ось|ся|ается|аются)|остаётся|не проверен\w*|не проверял\w*|"
+    r"ждёт|ждет|нужно ещё|нужна ещё|требуется)\b\s*[:—-]?\s*(.+)$")
+
+
+def run(*cmd, check=False):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        sys.exit(f"merge-trace: {' '.join(cmd[:3])}…: {(r.stderr or r.stdout).strip()[:300]}")
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def parse_pr(ref, repo):
+    """(slug, номер) из URL, owner/name#N или номера."""
+    ref = ref.split()[0]  # «URL (уже слит)» из маркера worker-done
+    m = re.search(r"github\.com/([^/]+/[^/]+)/pull/(\d+)", ref)
+    if m:
+        return m.group(1), m.group(2)
+    m = re.fullmatch(r"([^/#\s]+/[^/#\s]+)#(\d+)", ref)
+    if m:
+        return m.group(1), m.group(2)
+    if ref.isdigit():
+        if not repo:
+            url = run("git", "config", "--get", "remote.origin.url")
+            repo = re.sub(r"\.git$", "", re.sub(r"^(git@[^:]+:|https?://[^/]+/)", "", url))
+        return repo, ref
+    sys.exit(f"merge-trace: PR не читается: {ref}")
+
+
+def tail_of(comments):
+    """Хвост из последнего итога воркера."""
+    for c in reversed(comments):
+        t = c.get("text", "")
+        if t.startswith(("СДЕЛАНО:", "НЕ СДЕЛАНО:")):
+            body = t.split("\nВетки:")[0]
+            m = TAIL_RX.search(body)
+            if m:
+                return " ".join(m.group(2).split())[:400]
+            if t.startswith("НЕ СДЕЛАНО:"):
+                return " ".join(body[len("НЕ СДЕЛАНО:"):].split())[:400]
+            break
+    return "хвост в итоге воркера не назван — проверь, что осталось, прежде чем закрывать"
+
+
+def trace(anchor, ref, repo, dry):
+    slug, n = parse_pr(ref, repo)
+    out = run("gh", "pr", "view", n, "-R", slug, "--json", "state,mergedAt,mergeCommit")
+    if not out:
+        print(f"{anchor} {slug}#{n}: PR не прочитан — пропуск")
+        return
+    pr = json.loads(out)
+    if pr.get("state") != "MERGED":
+        print(f"{anchor} {slug}#{n}: {pr.get('state')}, не слит — следа нет")
+        return
+    raw = run("bd", "show", anchor, "--json")
+    try:
+        d = json.loads(raw)
+        d = d[0] if isinstance(d, list) else d
+    except ValueError:
+        print(f"{anchor}: якоря нет в beads — пропуск")
+        return
+    if d.get("status") == "closed":
+        print(f"{anchor}: уже закрыт — след не нужен")
+        return
+    try:
+        comments = json.loads(run("bd", "comments", anchor, "--json") or "[]")
+    except ValueError:
+        comments = []
+    key = f"[merge-trace {slug}#{n}]"
+    if any(key in c.get("text", "") for c in comments):
+        print(f"{anchor} {slug}#{n}: след уже есть — пропуск")
+        return
+    sha = ((pr.get("mergeCommit") or {}).get("oid") or "?")[:7]
+    day = (pr.get("mergedAt") or "")[:10] or datetime.date.today().isoformat()
+    note = f"PR #{n} слит {sha} {day}, осталось: {tail_of(comments)}. Задача не закрыта: слияние ≠ готово. {key}"
+    if dry:
+        print(f"[сухой прогон] {anchor} ← комментарий: {note}")
+        print(f"[сухой прогон] {anchor} ← метка {LABEL}")
+        return
+    r = subprocess.run(["bd", "comments", "add", anchor, note], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"merge-trace: комментарий в {anchor} не записался: {r.stderr.strip()[:200]}")
+    if LABEL not in (d.get("labels") or []):
+        subprocess.run(["bd", "label", "add", anchor, LABEL], capture_output=True, text=True)
+    print(f"{anchor} {slug}#{n}: след слияния записан")
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        sys.exit(0 if a else 2)
+    dry = "--dry-run" in a
+    a = [x for x in a if x != "--dry-run"]
+    repo = None
+    if "--repo" in a:
+        i = a.index("--repo")
+        repo = a[i + 1]
+        del a[i:i + 2]
+    if a[0] == "--sweep":
+        for tree in a[1:]:
+            try:
+                m = json.load(open(os.path.join(tree, ".anchor", "done.json")))
+            except (OSError, ValueError):
+                continue
+            for pr in m.get("prs", []):
+                if "/pull/" in pr:
+                    trace(m.get("anchor", ""), pr, None, dry)
+        return
+    if len(a) != 2:
+        sys.exit("merge-trace: нужны <якорь> <PR>")
+    trace(a[0], a[1], repo, dry)
+
+
+if __name__ == "__main__":
+    main()

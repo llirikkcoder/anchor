@@ -260,6 +260,9 @@ def main() -> None:
                 raise Stop(f"{it['url']}: не слился ({state or 'нет ответа'}); уже слито: {done}")
             result["merged"].append(it["url"])
             say(f"СЛИТО {it['name']} #{it['pr']}")
+            # След на якоре: слито ≠ готово, задачу не закрываем (merge-trace).
+            subprocess.run([os.path.join(HERE, "merge-trace"), a["anchor"], it["pr"], "--repo", it["slug"]],
+                           check=False)
             # Ветку не удаляем: имя merged/… говорит, чем кончилось, и работа
             # восстановима. Переименование после слияния PR уже не закрывает.
             if a["rename"]:

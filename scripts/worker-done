@@ -216,6 +216,12 @@ done
 here=$(dirname "$0")
 [ -x "$here/worker-state" ] && (cd "${trees[0]}" && "$here/worker-state" "done" "$word" >/dev/null)
 
+# След слияния: если PR уже слит (воркер слил сам до сдачи), якорь получает
+# «PR #N слит …, осталось: …». Открытый PR — тишина; повтор — тоже (см. merge-trace).
+if [ "$status" = "done" ] && [ -x "$here/merge-trace" ]; then
+  for t in "${trees[@]}"; do "$here/merge-trace" --sweep "$t" >&2 || true; done
+fi
+
 echo "$word · $anchor"
 printf '  %s\n' "${pr_lines[@]}"
 echo "  маркер: ${trees[0]}/.anchor/done.json"
