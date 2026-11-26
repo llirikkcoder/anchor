@@ -72,7 +72,7 @@ BASH_DENY = [
     (r"\bgit\s+branch\s+-[dD]\b", "удаление веток — оркестратор"),
     # Только запись в эти файлы, а не любое упоминание: 18.10.2026 воркер получил
     # отказ на worker-state, потому что в тексте причины встретилось имя ограды.
-    (r"(>|\btee\b|\bsed\s+-i|\bcp\b|\bmv\b|\brm\b|\bln\b|\bchmod\b)[^|;&]*(worker-guard|settings(\.local)?\.json|\.claude/hooks|\.claude\.json|\.codex/|AGENTS\.override\.md)", "ограду и настройки агента правит только оркестратор"),
+    (r"(>|\btee\b|\bsed\s+-i|\bcp\b|\bmv\b|\brm\b|\bln\b|\bchmod\b)[^|;&]*(worker-guard|settings(\.local)?\.json|\.claude/hooks|\.claude\.json|\.codex/|AGENTS\.override\.md|agy-hook|\.agents/hooks\.json|\.gemini/|GEMINI\.md)", "ограду и настройки агента правит только оркестратор"),
     (r"(>|\btee\b|\bsed\s+-i|\bcp\b|\bmv\b|\brm\b|\bln\b|\bchmod\b)[^|;&]*deploy_allow", "список разрешённого деплоя ведёт только владелец"),
     (r"(^|[;&|]\s*|\s)(pkill|killall)\b", "pkill/killall бьют по шаблону и задевают чужие процессы — останавливай свой процесс по pid"),
     (r"\bcrontab\b|\bsystemctl\s+(start|stop|restart|enable|disable)\b", "службы машины"),
@@ -87,6 +87,9 @@ WRITE_DENY = [
     (r"(^|/)\.claude\.json$", "настройки Claude правит только оркестратор"),
     # Воркер на Codex (aio-r7hp): его настройки и роль — те же файлы по смыслу.
     (r"(^|/)\.codex/(config\.toml|hooks\.json|hooks/)", "настройки Codex правит только оркестратор"),
+    # agy: ограда — .agents/hooks.json дерева, роль — GEMINI.md (anchor-queue,
+    # write_agy_hooks); общие настройки — ~/.gemini. Правка любого — снятие ограды.
+    (r"(^|/)\.agents/hooks\.json$|(^|/)GEMINI\.md$|(^|/)\.gemini/", "ограду и настройки agy правит только оркестратор"),
     (r"(^|/)AGENTS\.override\.md$", "роль воркера пишет очередь, не воркер"),
 ]
 
